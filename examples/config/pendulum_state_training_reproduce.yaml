@@ -1,13 +1,16 @@
-user:
-  run_dir: ./output/pendulum_state/${now:%Y-%m-%d}/${now:%H-%M-%S}
-  wandb_enabled: false
-  wandb_entity: ???
-  load_lyaloss: examples/data/pendulum/state_feedback/lyaloss_init.pth
-  Vmin_x_pgd_path: null
-  derivative_x_buffer_path: null
+defaults:
+  - user: pendulum_state_training_default
+  - train_template
+
+hydra:
+  run:
+    dir: ${user.run_dir}
+  sweep:
+    dir: ${user.run_dir}
+
 seed: 1234
 model:
-  load_lyaloss: /home/hongkaidai/neural_lyapunov_training/models/pendulum_state_feedback.pth
+  load_lyaloss: models/pendulum_state_feedback.pth
   save_lyaloss: true
   limit_scale: [1]
   kappa: 0.01

@@ -17,8 +17,10 @@ import neural_lyapunov_training.models as models
 import neural_lyapunov_training.path_tracking as path_tracking
 import neural_lyapunov_training.train_utils as train_utils
 
-device = torch.device("cuda")
+# Use CUDA if available, otherwise use CPU (for Mac/systems without CUDA)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 dtype = torch.float
+print(f"Using device: {device}")
 
 
 def compute_lqr(path_tracking_continuous: path_tracking.PathTrackingDynamics):

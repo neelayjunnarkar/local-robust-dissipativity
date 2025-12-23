@@ -19,8 +19,10 @@ import neural_lyapunov_training.quadrotor2d as quadrotor2d
 import neural_lyapunov_training.train_utils as train_utils
 import neural_lyapunov_training.output_train_utils as output_train_utils
 
-device = torch.device("cuda")
+# Use CUDA if available, otherwise use CPU (for Mac/systems without CUDA)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 dtype = torch.float
+print(f"Using device: {device}")
 
 
 def approximate_lqr(

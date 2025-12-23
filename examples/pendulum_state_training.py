@@ -19,7 +19,7 @@ import neural_lyapunov_training.models as models
 import neural_lyapunov_training.pendulum as pendulum
 import neural_lyapunov_training.train_utils as train_utils
 
-device = torch.device("cuda")
+device = torch.device("cpu")
 dtype = torch.float
 
 
@@ -164,7 +164,8 @@ def main(cfg: DictConfig):
             torch.load(
                 os.path.join(
                     os.path.dirname(__file__), "../", cfg.model.controller_path
-                )
+                ),
+                map_location=device
             )
         )
     else:
@@ -215,7 +216,7 @@ def main(cfg: DictConfig):
         load_lyaloss = os.path.join(
             os.path.dirname(__file__), "../", cfg.model.load_lyaloss
         )
-        derivative_lyaloss.load_state_dict(torch.load(load_lyaloss)["state_dict"])
+        derivative_lyaloss.load_state_dict(torch.load(load_lyaloss, map_location=device)["state_dict"])
 
     if absolute_output:
         positivity_lyaloss = None

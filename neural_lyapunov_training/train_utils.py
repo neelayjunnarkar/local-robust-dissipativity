@@ -237,7 +237,7 @@ def compute_sample_loss(
         sample_output = torch.clamp(-lya_sample, min=0.0)
         sample_loss = sample_output.sum()  # max()
         max_sample_violation = sample_output.max().item()
-        unsatisfied_sample = (lya_sample < 0).abs().sum().item()
+        unsatisfied_sample = (lya_sample < 0).sum().item()
     else:
         max_sample_violation = unsatisfied_sample = 0
         sample_loss = torch.tensor(0, device=device)

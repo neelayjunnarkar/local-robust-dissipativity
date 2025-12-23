@@ -16,8 +16,10 @@ import neural_lyapunov_training.train_utils as train_utils
 import wandb
 import os
 
-device = torch.device("cuda")
+# Use CUDA if available, otherwise use CPU (for Mac/systems without CUDA)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 dtype = torch.float
+print(f"Using device: {device}")
 
 
 @hydra.main(config_path="./config", config_name="quadrotor2d_output_training")

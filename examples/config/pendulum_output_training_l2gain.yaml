@@ -8,7 +8,7 @@ hydra:
   sweep:
     dir: ${user.run_dir}
 
-wandb_name: pendulum_output
+wandb_name: pendulum_output_l2gain
 
 # Boolean to approximate LQR
 approximate_lqr: False
@@ -18,23 +18,30 @@ pgd_verifier_steps: 300
 # =============================================================================
 # Supply Rate Configuration (Dissipativity Framework)
 # =============================================================================
-# Default: lyapunov (standard Lyapunov stability, backward compatible)
+# Options: lyapunov, l2gain, passivity
+#
+# For lyapunov:  s = -κV(x)           → standard Lyapunov stability
+# For l2gain:    s = γ²‖w‖² - ‖z‖²   → L2-gain bound from w to z
+# For passivity: s = wᵀz              → passive system
 # =============================================================================
 supply_rate:
-  type: lyapunov
-  # kappa is taken from model.kappa for backward compatibility
+  type: l2gain
+  gamma: 1000.0           # L2-gain bound
+  w_dim: 1             # Disturbance dimension (additive to control)
+  w_max: 0.025          # Disturbance bound: |w| ≤ w_max
 
 model:
   lyapunov:
     quadratic: True
     hidden_widths: [16, 16, 8]
   load_lyaloss: ${user.load_lyaloss}
-  kappa: 0.001
+  kappa: 0.001         # Only used if supply_rate.type = lyapunov
   V_decrease_within_roa: True
   limit_scale: [0.1, 0.2, 0.3, 0.4]
   V_psd_form: "L1"
   rho_multiplier: [2.0, 1.8, 1.6, 1.4]
   u_max: 0.25
+  save_lyaloss: True
 
 train:
   train_lyaloss: True
