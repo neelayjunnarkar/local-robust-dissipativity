@@ -11,6 +11,7 @@ import neural_lyapunov_training.lyapunov as lyapunov
 import neural_lyapunov_training.controllers as controllers
 import neural_lyapunov_training.pendulum as pendulum
 import neural_lyapunov_training.output_train_utils as output_train_utils
+import neural_lyapunov_training.supply_rate as supply_rate_module
 import itertools
 import pendulum_state_training as pt
 
@@ -18,8 +19,46 @@ import neural_lyapunov_training.train_utils as train_utils
 import wandb
 import os
 
-device = torch.device("cuda")
+
+def create_supply_rate(cfg, kappa: float) -> supply_rate_module.SupplyRate:
+    """
+    Create supply rate from config.
+    
+    For backward compatibility:
+    - If supply_rate not in config, defaults to Lyapunov with model.kappa
+    - If supply_rate.type == 'lyapunov', uses model.kappa
+    """
+    if not hasattr(cfg, 'supply_rate') or cfg.supply_rate is None:
+        # Backward compatibility: default to Lyapunov
+        return supply_rate_module.LyapunovSupplyRate(kappa=kappa)
+    
+    supply_type = cfg.supply_rate.get('type', 'lyapunov').lower()
+    
+    if supply_type == 'lyapunov':
+        # Use kappa from model config for backward compatibility
+        return supply_rate_module.LyapunovSupplyRate(kappa=kappa)
+    elif supply_type == 'l2gain':
+        gamma = cfg.supply_rate.get('gamma', 1.0)
+        return supply_rate_module.L2GainSupplyRate(gamma=gamma)
+    elif supply_type == 'passivity':
+        return supply_rate_module.PassivitySupplyRate()
+    else:
+        raise ValueError(f"Unknown supply rate type: {supply_type}")
+
+
+def get_w_max(cfg) -> torch.Tensor:
+    """Get disturbance bound from config."""
+    if hasattr(cfg, 'supply_rate') and cfg.supply_rate is not None:
+        w_max = cfg.supply_rate.get('w_max', None)
+        if w_max is not None:
+            return torch.tensor([w_max])
+    return None
+
+
+# Use CUDA if available, otherwise use CPU (for Mac/systems without CUDA)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 dtype = torch.float
+print(f"Using device: {device}")
 
 
 @hydra.main(config_path="./config", config_name="pendulum_output_training")
@@ -68,7 +107,8 @@ def main(cfg: DictConfig):
             os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
                 "data/pendulum/output_feedback/controller_[8, 8, 8].pth",
-            )
+            ),
+            map_location=device
         )
     )
     controller.eval()
@@ -92,7 +132,8 @@ def main(cfg: DictConfig):
             os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
                 "data/pendulum/output_feedback/observer_[8, 8].pth",
-            )
+            ),
+            map_location=device
         )
     )
     observer.eval()
@@ -137,14 +178,16 @@ def main(cfg: DictConfig):
             activation=nn.LeakyReLU,
             V_psd_form=cfg.model.V_psd_form,
         )
-        lyapunov_nn.load_state_dict(
-            torch.load(
-                os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)),
-                    "data/pendulum/output_feedback/lyapunov_init.pth",
-                )
-            )
-        )
+        # Comment out pre-trained weights if changing network architecture
+        # lyapunov_nn.load_state_dict(
+        #     torch.load(
+        #         os.path.join(
+        #             os.path.dirname(os.path.abspath(__file__)),
+        #             "data/pendulum/output_feedback/lyapunov_init.pth",
+        #         ),
+        #         map_location=device
+        #     )
+        # )
         lyapunov_nn.eval()
     lyapunov_nn.to(device)
 
@@ -162,16 +205,28 @@ def main(cfg: DictConfig):
 
     kappa = cfg.model.kappa
     hard_max = cfg.train.hard_max
-    # Placeholder for loading models
-    derivative_lyaloss = lyapunov.LyapunovDerivativeDOFLoss(
+    
+    # Create supply rate from config (backward compatible with pure Lyapunov)
+    supply_rate = create_supply_rate(cfg, kappa)
+    w_max = get_w_max(cfg)
+    
+    # Log supply rate type
+    logger = logging.getLogger(__name__)
+    logger.info(f"Using supply rate: {type(supply_rate).__name__}")
+    if w_max is not None:
+        logger.info(f"Disturbance bound w_max: {w_max}")
+    
+    # Placeholder for loading models (using dissipativity framework)
+    derivative_lyaloss = lyapunov.DissipativityDerivativeDOFLoss(
         dynamics,
         observer,
         controller,
         lyapunov_nn,
-        0,
-        0,
-        1,
-        kappa=kappa,
+        supply_rate=supply_rate,
+        box_lo=torch.zeros(4, device=device),  # placeholder
+        box_up=torch.zeros(4, device=device),  # placeholder
+        rho_multiplier=1,
+        w_max=w_max,
         hard_max=hard_max,
         beta=1,
         loss_weights=torch.tensor([0.5, 1.0, 0.5], device=device),
@@ -180,7 +235,7 @@ def main(cfg: DictConfig):
 
     if cfg.model.load_lyaloss is not None:
         load_lyaloss = cfg.model.load_lyaloss
-        derivative_lyaloss.load_state_dict(torch.load(load_lyaloss)["state_dict"])
+        derivative_lyaloss.load_state_dict(torch.load(load_lyaloss, map_location=device)["state_dict"])
 
     positivity_lyaloss = None
 
@@ -217,15 +272,16 @@ def main(cfg: DictConfig):
             )
 
             rho_multiplier = cfg.model.rho_multiplier[n]
-            derivative_lyaloss = lyapunov.LyapunovDerivativeDOFLoss(
+            derivative_lyaloss = lyapunov.DissipativityDerivativeDOFLoss(
                 dynamics,
                 observer,
                 controller,
                 lyapunov_nn,
-                lower_limit,
-                upper_limit,
-                rho_multiplier,
-                kappa=kappa,
+                supply_rate=supply_rate,
+                box_lo=lower_limit,
+                box_up=upper_limit,
+                rho_multiplier=rho_multiplier,
+                w_max=w_max,
                 hard_max=hard_max,
                 beta=1,
                 loss_weights=torch.tensor([0.5, 1.0, 0.5], device=device),
@@ -283,16 +339,20 @@ def main(cfg: DictConfig):
         upper_limit = limit
         rho_multiplier = cfg.model.rho_multiplier[-1]
 
-    # "Verify" Lyapunov conditions with PGD attack
-    derivative_lyaloss_check = lyapunov.LyapunovDerivativeDOFLoss(
+    # "Verify" dissipativity conditions with PGD attack
+    # For verification, use supply rate with kappa=0 (strict decrease) for Lyapunov
+    # or the configured supply rate for L2-gain
+    supply_rate_check = create_supply_rate(cfg, kappa=0.0)
+    derivative_lyaloss_check = lyapunov.DissipativityDerivativeDOFLoss(
         dynamics,
         observer,
         controller,
         lyapunov_nn,
-        lower_limit,
-        upper_limit,
+        supply_rate=supply_rate_check,
+        box_lo=lower_limit,
+        box_up=upper_limit,
         rho_multiplier=rho_multiplier,
-        kappa=0e-3,
+        w_max=w_max,
         hard_max=True,
     )
     for seed in range(50):

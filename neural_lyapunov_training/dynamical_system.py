@@ -86,6 +86,8 @@ class SecondOrderDiscreteTimeSystem(DiscreteTimeSystem):
     """
     This discrete-time system is constructed by discretizing a continuous time
     second-order dynamical system in time.
+    
+    Supports optional disturbance input w for dissipativity analysis.
     """
 
     def __init__(
@@ -112,13 +114,27 @@ class SecondOrderDiscreteTimeSystem(DiscreteTimeSystem):
         self.position_integration = position_integration
         self.continuous_time_system = continuous_time_system
         self.Ix = torch.eye(self.nx)
+        # Disturbance dimension (if supported by continuous system)
+        self.nw = getattr(continuous_time_system, 'nw', 0)
 
-    def forward(self, x, u):
+    def forward(self, x, u, w=None):
         """
-        Compute x_next for a batch of x and u
+        Compute x_next for a batch of x and u, with optional disturbance w.
+        
+        Args:
+            x: state (batch, nx)
+            u: control input (batch, nu)
+            w: disturbance input (batch, nw), optional
+            
+        Returns:
+            x_next: next state (batch, nx)
         """
         assert x.shape[0] == u.shape[0]
-        qddot = self.continuous_time_system.forward(x, u)
+        # Pass disturbance to continuous-time system if supported
+        if w is not None and hasattr(self.continuous_time_system, 'nw'):
+            qddot = self.continuous_time_system.forward(x, u, w)
+        else:
+            qddot = self.continuous_time_system.forward(x, u)
         if self.velocity_integration == IntegrationMethod.ExplicitEuler:
             qdot_next = x[:, self.nq :] + qddot * self.dt
         else:
@@ -130,6 +146,16 @@ class SecondOrderDiscreteTimeSystem(DiscreteTimeSystem):
         else:
             raise NotImplementedError
         return torch.cat((q_next, qdot_next), dim=1)
+    
+    def output(self, x, u):
+        """
+        Performance output z for dissipativity analysis.
+        Delegates to continuous-time system if available.
+        """
+        if hasattr(self.continuous_time_system, 'output'):
+            return self.continuous_time_system.output(x, u)
+        else:
+            return self.continuous_time_system.h(x)
 
     def linearized_dynamics(self, x, u):
         Ac, Bc = self.continuous_time_system.linearized_dynamics(x, u)

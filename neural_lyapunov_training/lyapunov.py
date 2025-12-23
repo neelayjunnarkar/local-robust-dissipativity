@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch
 import neural_lyapunov_training.controllers as controllers
 import neural_lyapunov_training.dynamical_system as dynamical_system
+import neural_lyapunov_training.supply_rate as supply_rate_module
 
 
 def soft_max(x: torch.Tensor, beta: float = 100):
@@ -483,6 +484,411 @@ class LyapunovDerivativeSimpleLossWithVBox(LyapunovDerivativeSimpleLossWithV):
     def forward(self, *args, **kwargs):
         loss_and_V = super().forward(*args, save_new_x=True, **kwargs)
         return torch.cat((loss_and_V, self.new_x), dim=1)
+
+
+# =============================================================================
+# Dissipativity-Based Loss Functions (Generalization of Lyapunov)
+# =============================================================================
+
+class DissipativityDerivativeLoss(nn.Module):
+    """
+    Dissipativity-based derivative loss for state feedback.
+    
+    Verifies the dissipativity condition:
+        V(x_{t+1}) - V(x_t) ≤ s(w, z, V(x))
+    
+    Equivalently (for verification, we want this ≥ 0):
+        V(x_t) - V(x_{t+1}) + s(w, z, V(x)) ≥ 0
+    
+    Supply rate types:
+        - Lyapunov:  s = -κV(x)           → reduces to standard Lyapunov
+        - L2-gain:   s = γ²‖w‖² - ‖z‖²   → bounded L2 gain
+        - Passivity: s = wᵀz              → passive system
+    
+    For Lyapunov supply rate, this is mathematically equivalent to
+    LyapunovDerivativeSimpleLoss.
+    """
+    
+    def __init__(
+        self,
+        dynamics: dynamical_system.DiscreteTimeSystem,
+        controller: controllers.NeuralNetworkController,
+        lyap_nn: NeuralNetworkLyapunov,
+        supply_rate: supply_rate_module.SupplyRate,
+        w_max: Optional[torch.Tensor] = None,
+        *args,
+        **kwargs
+    ):
+        """
+        Args:
+            dynamics: Discrete-time dynamical system
+            controller: Neural network controller
+            lyap_nn: Neural network Lyapunov function
+            supply_rate: Supply rate object (Lyapunov, L2-gain, or Passivity)
+            w_max: Disturbance bound |w| ≤ w_max. Required for L2-gain/Passivity.
+        """
+        super().__init__(*args, **kwargs)
+        self.dynamics = dynamics
+        self.controller = controller
+        self.lyapunov = lyap_nn
+        self.supply_rate = supply_rate
+        self.w_max = w_max
+        
+        # Validate configuration
+        if supply_rate.requires_disturbance:
+            assert w_max is not None, "Supply rate requires disturbance bound w_max"
+    
+    def forward(self, x: torch.Tensor, w: Optional[torch.Tensor] = None, save_new_x: bool = False):
+        """
+        Compute dissipativity loss.
+        
+        Args:
+            x: State (batch, nx)
+            w: Disturbance (batch, nw). Required for L2-gain/Passivity.
+            save_new_x: Whether to save x_next for inspection
+            
+        Returns:
+            Loss = V(x) - V(x_next) + s(w, z, V(x)), should be ≥ 0
+        """
+        # Control input
+        u = self.controller(x)
+        
+        # Next state (with disturbance if provided)
+        new_x = self.dynamics.forward(x, u, w)
+        if save_new_x:
+            self.new_x = new_x
+        
+        # Lyapunov values
+        V_x = self.lyapunov(x)
+        V_next = self.lyapunov(new_x)
+        self.last_lyapunov_x = V_x.detach()
+        
+        # Performance output z (for L2-gain/Passivity)
+        z = None
+        if self.supply_rate.requires_output:
+            z = self.dynamics.output(x, u)
+        
+        # Compute supply rate
+        supply = self.supply_rate(w, z, V_x)
+        
+        # Dissipativity: V(x) - V(x_next) + s ≥ 0
+        loss = V_x - V_next + supply
+        
+        return loss
+    
+    @property
+    def kappa(self):
+        """For compatibility: extract kappa if using Lyapunov supply rate."""
+        if isinstance(self.supply_rate, supply_rate_module.LyapunovSupplyRate):
+            return self.supply_rate.kappa
+        return 0.0
+
+
+class DissipativityDerivativeLossWithV(DissipativityDerivativeLoss):
+    """
+    Dissipativity loss with V(x) as second output for level set verification.
+    """
+    
+    def forward(self, x: torch.Tensor, w: Optional[torch.Tensor] = None, *args, **kwargs):
+        loss = super().forward(x, w, *args, **kwargs)
+        return torch.cat((loss, self.last_lyapunov_x), dim=1)
+
+
+class DissipativityDerivativeLossWithVBox(DissipativityDerivativeLossWithV):
+    """
+    Additionally output x_next for bounding box verification.
+    """
+    
+    def forward(self, x: torch.Tensor, w: Optional[torch.Tensor] = None, *args, **kwargs):
+        loss_and_V = super().forward(x, w, save_new_x=True, *args, **kwargs)
+        return torch.cat((loss_and_V, self.new_x), dim=1)
+
+
+class DissipativityDerivativeDOFLoss(nn.Module):
+    """
+    Dissipativity-based derivative loss for dynamic output feedback.
+    
+    Augmented state ξ = [x, e] where e = x - z (estimation error).
+    
+    Verifies:
+        V(ξ_{t+1}) - V(ξ_t) ≤ s(w, z, V(ξ))
+    
+    For L2-gain/Passivity, disturbance w is sampled uniformly in [-w_max, w_max]
+    when not provided explicitly.
+    """
+    
+    def __init__(
+        self,
+        dynamics: dynamical_system.DiscreteTimeSystem,
+        observer,
+        controller: controllers.NeuralNetworkController,
+        lyap_nn: NeuralNetworkLyapunov,
+        supply_rate: supply_rate_module.SupplyRate,
+        box_lo: torch.Tensor,
+        box_up: torch.Tensor,
+        rho_multiplier: float,
+        w_max: Optional[torch.Tensor] = None,
+        beta: float = 100,
+        hard_max: bool = True,
+        loss_weights: Optional[torch.Tensor] = None,
+        *args,
+        **kwargs
+    ):
+        """
+        Args:
+            dynamics: Discrete-time dynamical system
+            observer: Neural network observer
+            controller: Neural network controller
+            lyap_nn: Neural network Lyapunov function
+            supply_rate: Supply rate object
+            box_lo, box_up: Bounding box for invariance
+            rho_multiplier: Multiplier for sublevel set ρ
+            w_max: Disturbance bound (scalar or tensor)
+            beta: Soft-max coefficient
+            hard_max: Use hard max (True) or soft max (False)
+            loss_weights: Weights for loss components
+        """
+        super().__init__(*args, **kwargs)
+        self.dynamics = dynamics
+        self.observer = observer
+        self.controller = controller
+        self.lyapunov = lyap_nn
+        self.supply_rate = supply_rate
+        self.rho_multiplier = rho_multiplier
+        self.box_lo = box_lo
+        self.box_up = box_up
+        self.nx = dynamics.continuous_time_system.nx
+        self.nw = getattr(dynamics.continuous_time_system, 'nw', 1)
+        self.x_boundary: typing.Optional[torch.Tensor] = None
+        self.beta = beta
+        self.hard_max = hard_max
+        
+        # Store w_max as tensor
+        if w_max is not None:
+            if isinstance(w_max, (int, float)):
+                self.w_max = torch.tensor([w_max])
+            else:
+                self.w_max = w_max
+        else:
+            self.w_max = None
+        
+        if loss_weights is None:
+            self.loss_weights = torch.tensor([1.0, 1.0, 1.0])
+        else:
+            assert loss_weights.shape == (3,)
+            assert torch.all(loss_weights > 0)
+            self.loss_weights = loss_weights
+    
+    def get_rho(self):
+        rho_boundary = self.lyapunov(self.x_boundary).min()
+        rho = self.rho_multiplier * rho_boundary
+        return rho
+    
+    @property
+    def kappa(self):
+        """For compatibility: extract kappa if using Lyapunov supply rate."""
+        if isinstance(self.supply_rate, supply_rate_module.LyapunovSupplyRate):
+            return self.supply_rate.kappa
+        return 0.0
+    
+    def _sample_disturbance(self, batch_size: int, device: torch.device) -> Optional[torch.Tensor]:
+        """Sample disturbance uniformly in [-w_max, w_max]."""
+        if not self.supply_rate.requires_disturbance or self.w_max is None:
+            return None
+        w_max = self.w_max.to(device)
+        # Uniform sampling in [-w_max, w_max]
+        w = (torch.rand(batch_size, self.nw, device=device) - 0.5) * 2 * w_max
+        return w
+    
+    def forward(self, xe: torch.Tensor, w: Optional[torch.Tensor] = None):
+        """
+        Compute dissipativity loss for output feedback.
+        
+        Args:
+            xe: Augmented state [x, e], shape (batch, 2*nx)
+            w: Disturbance (batch, nw). If None and required, sampled automatically.
+            
+        Returns:
+            Negated loss for verification (should be ≥ 0)
+        """
+        batch_size = xe.shape[0]
+        device = xe.device
+        
+        # Sample disturbance if required but not provided
+        if w is None and self.supply_rate.requires_disturbance:
+            w = self._sample_disturbance(batch_size, device)
+        
+        # Split augmented state
+        x = xe[:, :self.nx]
+        e = xe[:, self.nx:]
+        z_est = x - e  # Estimated state
+        
+        # Observation
+        y = self.observer.h(x)
+        ey = y - self.observer.h(z_est)
+        
+        # Control based on estimated state
+        u = self.controller.forward(torch.cat((z_est, ey), dim=1))
+        
+        # Dynamics with disturbance
+        new_x = self.dynamics.forward(x, u, w)
+        new_z = self.observer.forward(z_est, u, y)
+        new_xe = torch.cat((new_x, new_x - new_z), dim=1)
+        self.new_xe = new_xe
+        
+        # Lyapunov values
+        V_xe = self.lyapunov(xe)
+        self.last_lyapunov_x = V_xe.detach()
+        
+        # Performance output z (observation of true state)
+        z_out = None
+        if self.supply_rate.requires_output:
+            z_out = self.observer.h(x)
+        
+        # Supply rate
+        supply = self.supply_rate(w, z_out, V_xe)
+        
+        # Get rho for ROA constraint
+        rho = self.get_rho()
+        
+        # Loss 1: Outside ROA (V(x) > ρ)
+        loss1 = self.loss_weights[0] * (rho - V_xe)
+        
+        # Loss 2: Dissipativity violation
+        # Want: V(xe) - V(new_xe) + s ≥ 0
+        # Violation: V(new_xe) - V(xe) - s > 0
+        dissipativity_violation = self.lyapunov(new_xe) - V_xe - supply
+        loss2 = self.loss_weights[1] * torch.nn.functional.relu(dissipativity_violation)
+        
+        # Loss 3: Box constraint violation
+        loss3 = self.loss_weights[2] * (
+            torch.nn.functional.relu(self.box_lo - new_xe).sum(dim=1, keepdim=True)
+            + torch.nn.functional.relu(new_xe - self.box_up).sum(dim=1, keepdim=True)
+        )
+        
+        loss23 = loss2 + loss3
+        
+        if self.hard_max:
+            loss = torch.min(
+                torch.cat((loss1, loss23), dim=-1),
+                dim=-1,
+                keepdim=True,
+            ).values
+            return -loss
+        else:
+            loss = soft_min(torch.cat((loss1, loss23), dim=-1), self.beta)
+            return -loss
+
+
+class DissipativityDerivativeDOFSimpleLoss(nn.Module):
+    """
+    Simple dissipativity loss for output feedback (no ROA constraint).
+    
+    Directly verifies: V(ξ) - V(ξ_next) + s(w, z, V(ξ)) ≥ 0
+    
+    For L2-gain/Passivity, disturbance w is sampled uniformly when not provided.
+    """
+    
+    def __init__(
+        self,
+        dynamics: dynamical_system.DiscreteTimeSystem,
+        observer,
+        controller: controllers.NeuralNetworkController,
+        lyap_nn: NeuralNetworkLyapunov,
+        supply_rate: supply_rate_module.SupplyRate,
+        w_max: Optional[torch.Tensor] = None,
+        *args,
+        **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.dynamics = dynamics
+        self.observer = observer
+        self.controller = controller
+        self.lyapunov = lyap_nn
+        self.supply_rate = supply_rate
+        self.nx = dynamics.continuous_time_system.nx
+        self.nw = getattr(dynamics.continuous_time_system, 'nw', 1)
+        self.x_boundary: typing.Optional[torch.Tensor] = None
+        
+        # Store w_max as tensor
+        if w_max is not None:
+            if isinstance(w_max, (int, float)):
+                self.w_max = torch.tensor([w_max])
+            else:
+                self.w_max = w_max
+        else:
+            self.w_max = None
+    
+    @property
+    def kappa(self):
+        if isinstance(self.supply_rate, supply_rate_module.LyapunovSupplyRate):
+            return self.supply_rate.kappa
+        return 0.0
+    
+    def _sample_disturbance(self, batch_size: int, device: torch.device) -> Optional[torch.Tensor]:
+        """Sample disturbance uniformly in [-w_max, w_max]."""
+        if not self.supply_rate.requires_disturbance or self.w_max is None:
+            return None
+        w_max = self.w_max.to(device)
+        w = (torch.rand(batch_size, self.nw, device=device) - 0.5) * 2 * w_max
+        return w
+    
+    def forward(self, xe: torch.Tensor, w: Optional[torch.Tensor] = None):
+        batch_size = xe.shape[0]
+        device = xe.device
+        
+        # Sample disturbance if required but not provided
+        if w is None and self.supply_rate.requires_disturbance:
+            w = self._sample_disturbance(batch_size, device)
+        
+        # Split augmented state
+        x = xe[:, :self.nx]
+        e = xe[:, self.nx:]
+        z_est = x - e
+        
+        # Observation and control
+        y = self.observer.h(x)
+        ey = y - self.observer.h(z_est)
+        u = self.controller.forward(torch.cat((z_est, ey), dim=1))
+        
+        # Dynamics with disturbance
+        new_x = self.dynamics.forward(x, u, w)
+        new_z = self.observer.forward(z_est, u, y)
+        self.new_xe = torch.cat((new_x, new_x - new_z), dim=1)
+        
+        # Lyapunov values
+        V_xe = self.lyapunov(xe)
+        V_next = self.lyapunov(self.new_xe)
+        self.last_lyapunov_x = V_xe.detach()
+        
+        # Performance output
+        z_out = None
+        if self.supply_rate.requires_output:
+            z_out = self.observer.h(x)
+        
+        # Supply rate
+        supply = self.supply_rate(w, z_out, V_xe)
+        
+        # Dissipativity: V(xe) - V(next) + s ≥ 0
+        loss = V_xe - V_next + supply
+        
+        return loss
+
+
+class DissipativityDerivativeDOFLossWithV(DissipativityDerivativeDOFSimpleLoss):
+    """Output feedback dissipativity loss with V as second output."""
+    
+    def forward(self, xe: torch.Tensor, w: Optional[torch.Tensor] = None, *args, **kwargs):
+        loss = super().forward(xe, w, *args, **kwargs)
+        return torch.cat((loss, self.last_lyapunov_x), dim=1)
+
+
+class DissipativityDerivativeDOFLossWithVBox(DissipativityDerivativeDOFLossWithV):
+    """Additionally output x_next for box verification."""
+    
+    def forward(self, xe: torch.Tensor, w: Optional[torch.Tensor] = None, *args, **kwargs):
+        loss_and_V = super().forward(xe, w, *args, **kwargs)
+        return torch.cat((loss_and_V, self.new_xe), dim=1)
 
 
 class LyapunovDerivativeDOFLoss(nn.Module):
