@@ -153,7 +153,7 @@ class L2GainSupplyRate(SupplyRate):
         w_norm_sq = (w ** 2).sum(dim=-1, keepdim=True)
         z_norm_sq = (z ** 2).sum(dim=-1, keepdim=True)
         
-        return self.gamma ** 2 * w_norm_sq - z_norm_sq
+        return  w_norm_sq - ((1/self.gamma) ** 2 ) * z_norm_sq
     
     @property
     def requires_disturbance(self) -> bool:
