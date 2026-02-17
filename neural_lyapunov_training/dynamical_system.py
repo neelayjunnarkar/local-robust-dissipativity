@@ -198,3 +198,68 @@ class SecondOrderDiscreteTimeSystem(DiscreteTimeSystem):
     @property
     def u_equilibrium(self):
         return self.continuous_time_system.u_equilibrium
+
+
+class NormalizedDynamicsWrapper(DiscreteTimeSystem):
+    """
+    Wraps a DiscreteTimeSystem in normalized coordinates z = S·x.
+    
+    Given a positive-definite matrix P (e.g., from LQR), S = chol(P),
+    the coordinate transform z = S·x makes the quadratic form
+    x^T P x = z^T z (a unit sphere in z-space).
+    
+    All inputs/outputs are in z-space. The wrapper handles z↔x conversion
+    internally when calling the underlying dynamics.
+    """
+
+    def __init__(self, dynamics: DiscreteTimeSystem, S: torch.Tensor):
+        """
+        Args:
+            dynamics: The underlying discrete-time system in x-space.
+            S: (nx, nx) normalization matrix, typically chol(P).
+        """
+        super().__init__(dynamics.nx, dynamics.nu)
+        self.inner = dynamics
+        self.register_buffer('S', S.clone())
+        self.register_buffer('S_inv', torch.linalg.inv(S))
+        # Forward attributes from inner dynamics
+        self.continuous_time_system = dynamics.continuous_time_system
+        self.nw = getattr(dynamics, 'nw', 0)
+        self.dt = dynamics.dt
+
+    def _z_to_x(self, z: torch.Tensor) -> torch.Tensor:
+        """Convert z-space coordinates to x-space: x = x_eq + S⁻¹·z"""
+        return self.inner.x_equilibrium.to(z.device) + z @ self.S_inv.T
+
+    def _x_to_z(self, x: torch.Tensor) -> torch.Tensor:
+        """Convert x-space coordinates to z-space: z = S·(x - x_eq)"""
+        x_diff = x - self.inner.x_equilibrium.to(x.device)
+        return x_diff @ self.S.T
+
+    def forward(self, z, u, w=None):
+        """Dynamics in normalized error coordinates: z_next = S·(f(x_eq + S⁻¹·z, u, w) - x_eq)"""
+        x = self._z_to_x(z)
+        x_next = self.inner.forward(x, u, w)
+        return self._x_to_z(x_next)
+
+    def output(self, z, u):
+        """Performance output z_perf (in x-space, not normalized)."""
+        x = self._z_to_x(z)
+        return self.inner.output(x, u)
+
+    def linearized_dynamics(self, z, u):
+        x = self._z_to_x(z)
+        Ad, Bd = self.inner.linearized_dynamics(x, u)
+        # In z-space (for error z): Ad_z = S Ad S⁻¹, Bd_z = S Bd
+        Ad_z = self.S @ Ad @ self.S_inv
+        Bd_z = self.S @ Bd
+        return Ad_z, Bd_z
+
+    @property
+    def x_equilibrium(self):
+        """Equilibrium in z-space (error coordinates) is ALWAYS 0."""
+        return torch.zeros(self.nx, device=self.S.device, dtype=self.S.dtype)
+
+    @property
+    def u_equilibrium(self):
+        return self.inner.u_equilibrium

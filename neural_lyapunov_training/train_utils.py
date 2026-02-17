@@ -576,6 +576,7 @@ def batch_train_lyapunov(
     train_clf: bool,
     logger: logging.Logger,
     always_candidate_roa_regulizer: bool,
+    enable_wandb: bool = False,
 ) -> BatchTrainLyapunovReturn:
     """
     Minimize the Lyapunov function loss
@@ -633,9 +634,13 @@ def batch_train_lyapunov(
             p.numel() for p in derivative_lyaloss.observer.parameters()
         )
     if derivative_lyaloss.x_boundary is not None:
+        dataset_size = derivative_lyaloss.x_boundary.shape[0]
+        rho_value = derivative_lyaloss.get_rho().item()
         logger.info(
-            f"rho is {derivative_lyaloss.get_rho().item()}, dataset size={derivative_lyaloss.x_boundary.shape[0]}"
+            f"rho is {rho_value}, dataset size={dataset_size}"
         )
+        if enable_wandb:
+            wandb.log({"rho": rho_value, "dataset_size": dataset_size})
 
     called_optimizer_step = False
     derivative_loss_init = compute_sample_loss(
@@ -667,6 +672,12 @@ def batch_train_lyapunov(
     else:
         bounded_lyapunov = None
         bounded_state = None
+
+    # Plateau detection for epoch-level early stopping
+    best_buffer_loss = None
+    no_improvement_count = 0
+    plateau_patience = 10  # Stop after 10 epochs without improving best loss
+    plateau_rtol = 1e-3    # Relative tolerance for "significant" improvement
 
     for i in range(epochs):
         if update_Vmin_boundary_per_epoch:
@@ -721,25 +732,23 @@ def batch_train_lyapunov(
                 ).to(device)
                 loss += candidate_roa_regulizer
             if loss > 0:
-                lya_params = torch.cat(
-                    [
-                        p.contiguous().view(-1)
-                        for p in derivative_lyaloss.lyapunov.parameters()
-                    ]
-                )
-                l1_loss = torch.norm(lya_params, 1) / total_elements_lya
+                l1_loss = torch.tensor(0.0, device=device)
+                lya_params_list = [p.contiguous().view(-1) for p in derivative_lyaloss.lyapunov.parameters()]
+                if lya_params_list:
+                    lya_params = torch.cat(lya_params_list)
+                    l1_loss += torch.norm(lya_params, 1) / total_elements_lya
+                
                 if not train_clf:
-                    con_params = torch.cat(
-                        [p.view(-1) for p in derivative_lyaloss.controller.parameters()]
-                    )
-                    l1_loss += torch.norm(con_params, 1) / total_elements_con / 10
-                # l1_loss = lipschitz_regularizer(derivative_lyaloss.lyapunov, derivative_x[0]) + \
-                #     lipschitz_regularizer(derivative_lyaloss.controller, derivative_x[0])
+                    con_params_list = [p.view(-1) for p in derivative_lyaloss.controller.parameters()]
+                    if con_params_list:
+                        con_params = torch.cat(con_params_list)
+                        l1_loss += torch.norm(con_params, 1) / total_elements_con / 10
+                
                 if observer_loss is not None:
-                    obs_params = torch.cat(
-                        [p.view(-1) for p in derivative_lyaloss.observer.parameters()]
-                    )
-                    l1_loss += torch.norm(obs_params, 1) / total_elements_obs / 10
+                    obs_params_list = [p.view(-1) for p in derivative_lyaloss.observer.parameters()]
+                    if obs_params_list:
+                        obs_params = torch.cat(obs_params_list)
+                        l1_loss += torch.norm(obs_params, 1) / total_elements_obs / 10
                 if observer_loss is not None and observer_ratio > 0:
                     loss += observer_ratio * observer_loss(observer_x_samples).mean()
                 loss += l1_reg * l1_loss
@@ -802,6 +811,17 @@ def batch_train_lyapunov(
             if called_optimizer_step:
                 logger.info(print_msg)
             if buffer_loss == 0:
+                break
+            # Plateau detection: stop epochs early if loss isn't improving significantly
+            current_loss = buffer_loss.item()
+            if best_buffer_loss is None or current_loss < best_buffer_loss * (1 - plateau_rtol):
+                best_buffer_loss = current_loss
+                no_improvement_count = 0
+            else:
+                no_improvement_count += 1
+                
+            if no_improvement_count >= plateau_patience:
+                logger.info(f"  Epoch early stop at {i}: no significant improvement over best loss ({best_buffer_loss:.2e}) for {plateau_patience} epochs.")
                 break
     return BatchTrainLyapunovReturn(
         buffer_loss.item(),
@@ -881,15 +901,25 @@ def train_lyapunov_with_buffer(
     """
     limit = (upper_limit - lower_limit) / 2.0
     nx = derivative_lyaloss.lyapunov.x_dim
+    # Check for disturbance requirements
+    nw = getattr(derivative_lyaloss, 'nw', 0)
+    requires_w = getattr(derivative_lyaloss, 'requires_disturbance', False)
+    
     device = lower_limit.device
     dtype = lower_limit.dtype
     if derivative_x_buffer is None:
-        derivative_x_buffer = torch.empty((0, nx), device=device)
+        buffer_dim = nx + nw if requires_w else nx
+        derivative_x_buffer = torch.empty((0, buffer_dim), device=device)
     best_loss = np.inf
 
     # Find argmin(V(x_boundary)) through PGD attack on the boundary of the box.
     if Vmin_x_pgd is None:
         Vmin_x_pgd = torch.empty((0, nx), device=device)
+
+    # For early stopping
+    consecutive_satisfied_iters = 0
+    satisfied_threshold = 4 # Number of iterations with no violation before stopping
+    violation_tol = 1e-7
 
     # fig, ax = plt.subplots(1, 2)
     start_time = time.time()
@@ -911,25 +941,52 @@ def train_lyapunov_with_buffer(
 
         # First find the adversarial states through PGD attack.
 
-        # TODO(hongkai.dai): figure out a better way to get the clean_x. Should
-        # I start from the adversarial states in the previous iteration?
-        clean_x = (
-            (
-                torch.rand((samples_per_iter, nx), device=device, dtype=dtype)
-                - torch.full((nx,), 0.5, device=device, dtype=dtype)
+        if requires_w:
+            # Joint optimization over [x, w]
+            from neural_lyapunov_training.lyapunov import DissipativityVerificationWrapper
+            w_max = derivative_lyaloss.w_max
+            limit_w = w_max
+            limit_joint = torch.cat([limit, limit_w])
+            lower_boundary_joint = torch.cat([lower_limit, -limit_w])
+            upper_boundary_joint = torch.cat([upper_limit, limit_w])
+            
+            verification_wrapper = DissipativityVerificationWrapper(derivative_lyaloss, nx, nw)
+            clean_xw = (
+                (
+                    torch.rand((samples_per_iter, nx + nw), device=device, dtype=dtype)
+                    - 0.5
+                )
+                * limit_joint
+                * 2
             )
-            * limit
-            * 2
-        )
-        derivative_adv_x = pgd_attack(
-            clean_x,
-            derivative_lyaloss,
-            eps=limit,
-            steps=pgd_steps,
-            lower_boundary=lower_limit,
-            upper_boundary=upper_limit,
-            direction="minimize",
-        ).detach()
+            derivative_adv_x = pgd_attack(
+                clean_xw,
+                verification_wrapper,
+                eps=limit_joint,
+                steps=pgd_steps,
+                lower_boundary=lower_boundary_joint,
+                upper_boundary=upper_boundary_joint,
+                direction="minimize",
+            ).detach()
+            clean_x = clean_xw[:, :nx]
+        else:
+            clean_x = (
+                (
+                    torch.rand((samples_per_iter, nx), device=device, dtype=dtype)
+                    - torch.full((nx,), 0.5, device=device, dtype=dtype)
+                )
+                * limit
+                * 2
+            )
+            derivative_adv_x = pgd_attack(
+                clean_x,
+                derivative_lyaloss,
+                eps=limit,
+                steps=pgd_steps,
+                lower_boundary=lower_limit,
+                upper_boundary=upper_limit,
+                direction="minimize",
+            ).detach()
         derivative_x_buffer = update_adv_dataset(
             derivative_x_buffer, derivative_adv_x, derivative_lyaloss, buffer_size
         )
@@ -945,6 +1002,23 @@ def train_lyapunov_with_buffer(
             ).detach()
         else:
             positivity_adv_x = clean_x
+
+        # --- Early Stopping Check ---
+        # Convention: output ≥ 0 means "condition satisfied", output < 0 means "violation".
+        # PGD with direction="minimize" finds the worst-case (most negative) outputs.
+        # If even the PGD-found adversarial samples all have output ≥ 0, there are no violations.
+        with torch.no_grad():
+            adv_output = derivative_lyaloss(derivative_adv_x)
+            min_adv_output = adv_output.min().item()
+            if min_adv_output >= -violation_tol:
+                consecutive_satisfied_iters += 1
+                logger.info(f"  → No violations found (min output = {min_adv_output:.2e}), streak = {consecutive_satisfied_iters}/{satisfied_threshold}")
+            else:
+                consecutive_satisfied_iters = 0
+                
+        if consecutive_satisfied_iters >= satisfied_threshold:
+            logger.info(f"Early stopping at iter {i}: No violations found for {satisfied_threshold} consecutive iterations.")
+            break
 
         # Find maximal and minimal of V on the boundary of the verified region through PGD attacks.
         Vmax_x_pgd = (
@@ -999,6 +1073,7 @@ def train_lyapunov_with_buffer(
             train_clf,
             logger,
             always_candidate_roa_regulizer,
+            enable_wandb,
         )
         elapsed_time = time.time() - start_time
         logger.info(f"elapsed time = {elapsed_time}")
@@ -1027,8 +1102,11 @@ def train_lyapunov_with_buffer(
             wandb.log(
                 {
                     "buffer_loss": batch_train_lyapunov_ret.buffer_loss,
+                    "adv_loss": batch_train_lyapunov_ret.buffer_loss,
+                    "adv_sample": batch_train_lyapunov_ret.derivative_buffer_ret.unsatisfied,
                     "l1_loss": batch_train_lyapunov_ret.l1_loss,
                     "roa_loss": batch_train_lyapunov_ret.roa_loss,
+                    "candidate_roa_regulizer": batch_train_lyapunov_ret.roa_loss,
                     "epoch": batch_train_lyapunov_ret.epoch,
                     "initial_buffer_loss": batch_train_lyapunov_ret.derivative_buffer_ret_init.loss,
                     "initial_buffer_violations": batch_train_lyapunov_ret.derivative_buffer_ret_init.unsatisfied,
