@@ -22,6 +22,7 @@ import neural_lyapunov_training.pendulum as pendulum
 import neural_lyapunov_training.quadrotor2d as quadrotor2d
 import neural_lyapunov_training.path_tracking as path_tracking
 import neural_lyapunov_training.pvtol as pvtol
+import neural_lyapunov_training.supply_rate as supply_rate
 
 from neural_lyapunov_training.controllers import LinearController
 
@@ -457,7 +458,7 @@ def create_output_feedback_model(
     observer_parameters=None,
     loss_parameters=None,
     lyapunov_func="lyapunov.NeuralNetworkLyapunov",
-    loss_func="lyapunov.LyapunovDerivativeDOFLoss",
+    loss_func="lyapunov.DissipativityDerivativeLoss",
     controller_func="controllers.NeuralNetworkController",
     observer_func="controllers.NeuralNetworkLuenbergerObserver",
 ):
@@ -472,20 +473,27 @@ def create_output_feedback_model(
     ny = dynamics.continuous_time_system.ny
     nu = dynamics.continuous_time_system.nu
     h = lambda x: dynamics.continuous_time_system.h(x)
+    
+    # Ensure equilibrium points are on the correct device/dtype
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32 # Assuming float32
+    x_eq = dynamics.x_equilibrium.to(device).to(dtype)
+    u_eq = dynamics.u_equilibrium.to(device).to(dtype)
+    
     controller = eval(controller_func)(
         in_dim=nx + ny,
         out_dim=nu,
-        x_equilibrium=torch.concat((dynamics.x_equilibrium, torch.zeros(ny))),
-        u_equilibrium=dynamics.u_equilibrium,
+        x_equilibrium=torch.concat((x_eq, torch.zeros(ny, device=device, dtype=dtype))),
+        u_equilibrium=u_eq,
         **controller_parameters,
     )
     lyapunov_nn = eval(lyapunov_func)(
         x_dim=2 * nx,
-        goal_state=torch.concat((dynamics.x_equilibrium, torch.zeros(nx))),
+        goal_state=torch.concat((x_eq, torch.zeros(nx, device=device, dtype=dtype))),
         **lyapunov_parameters,
     )
     observer = eval(observer_func)(
-        nx, ny, dynamics, h, torch.zeros(1, ny), observer_parameters["fc_hidden_dim"]
+        nx, ny, dynamics, h, torch.zeros(1, ny, device=device, dtype=dtype), observer_parameters["fc_hidden_dim"]
     )
     loss = eval(loss_func)(
         dynamics, observer, controller, lyapunov_nn, **loss_parameters
@@ -531,6 +539,111 @@ def create_pendulum_output_feedback_model(dt=0.01, **kwargs):
         ),
         **kwargs,
     )
+
+
+def create_pendulum_l2gain_verification_model(
+    dt=0.01,
+    gamma=1.0,
+    w_max=0.05,
+    controller_parameters=None,
+    lyapunov_parameters=None,
+    observer_parameters=None,
+    path=None,
+):
+    """
+    Create pendulum output feedback model wrapped for L2-gain verification.
+    
+    Input to verifier: [xe, w] where xe = [x, e] (state + estimation error)
+    Verifies: V(xe) - V(xe_next) + γ²‖w‖² - ‖z‖² ≥ 0 for all (xe, w)
+    
+    Args:
+        dt: Time step
+        gamma: L2-gain bound
+        w_max: Disturbance bound (scalar)
+        controller_parameters: Controller config
+        lyapunov_parameters: Lyapunov function config
+        observer_parameters: Observer config
+        path: Path to pretrained weights
+        
+    Returns:
+        DissipativityVerificationWrapper with input dim = 2*nx + nw = 5
+    """
+    # Create dynamics
+    pendulum_continuous = pendulum.PendulumDynamics(m=0.15, l=0.5, beta=0.1)
+    dynamics = dynamical_system.SecondOrderDiscreteTimeSystem(pendulum_continuous, dt)
+    
+    nx = pendulum_continuous.nx  # 2
+    ny = pendulum_continuous.ny  # 1
+    nu = pendulum_continuous.nu  # 1
+    nw = pendulum_continuous.nw  # 1
+    
+    # Default parameters matching pendulum_output_training.py
+    if controller_parameters is None:
+        controller_parameters = {
+            "nlayer": 4,
+            "hidden_dim": 8,
+            "clip_output": "clamp",
+            "u_lo": torch.tensor([-0.25]),
+            "u_up": torch.tensor([0.25]),
+        }
+    if lyapunov_parameters is None:
+        lyapunov_parameters = {"R_rows": 4, "eps": 0.01}
+    if observer_parameters is None:
+        observer_parameters = {"fc_hidden_dim": [8, 8]}
+    
+    # Create controller (input: [z, ey], output: u)
+    h = lambda x: pendulum_continuous.h(x)
+    controller = controllers.NeuralNetworkController(
+        in_dim=nx + ny,
+        out_dim=nu,
+        x_equilibrium=torch.cat((dynamics.x_equilibrium, torch.zeros(ny))),
+        u_equilibrium=dynamics.u_equilibrium,
+        **controller_parameters,
+    )
+    
+    # Create Lyapunov function (input: xe, dim = 2*nx)
+    lyapunov_nn = lyapunov.NeuralNetworkQuadraticLyapunov(
+        goal_state=torch.cat((dynamics.x_equilibrium, torch.zeros(nx))),
+        x_dim=2 * nx,
+        **lyapunov_parameters,
+    )
+    
+    # Create observer
+    observer = controllers.NeuralNetworkLuenbergerObserver(
+        nx, ny, dynamics, h, torch.zeros(1, ny), observer_parameters["fc_hidden_dim"]
+    )
+    
+    # Create L2-gain supply rate
+    supply_rate_fn = supply_rate.L2GainSupplyRate(gamma=gamma)
+    
+    # Create dissipativity loss
+    loss_fn = lyapunov.DissipativityDerivativeLoss(
+        dynamics=dynamics,
+        controller=controller,
+        lyap_nn=lyapunov_nn,
+        supply_rate=supply_rate_fn,
+        box_lo=torch.zeros(2*nx, device=dynamics.device), # Dummy
+        box_up=torch.zeros(2*nx, device=dynamics.device), # Dummy
+        rho_multiplier=1e6, # Ignore ROA
+        w_max=torch.tensor([w_max]),
+        beta=100,
+        hard_max=True,
+        loss_weights=torch.tensor([0.0, 1.0, 0.0]), # Only dissipativity
+        observer=observer,
+    )
+    
+    # Load pretrained weights if provided
+    if path is not None:
+        loss_fn.load_state_dict(torch.load(path)["state_dict"])
+    
+    # Wrap for verification: input is [xe, w], dim = 2*nx + nw = 5
+    wrapped_model = lyapunov.DissipativityVerificationWrapper(
+        loss_fn=loss_fn,
+        state_dim=2 * nx,  # 4
+        w_dim=nw,          # 1
+    )
+    
+    return wrapped_model
 
 
 def create_path_tracking_model(dt=0.05, **kwargs):
@@ -683,16 +796,50 @@ def box_data(
     return X, labels, data_max, data_min, eps
 
 
-def simulate(lyaloss: lyapunov.LyapunovDerivativeLoss, steps: int, x0):
+def simulate(lyaloss, steps: int, x0):
     # Assumes explicit euler integration.
     x_traj = [None] * steps
     V_traj = [None] * steps
     x_traj[0] = x0
+    
     with torch.no_grad():
-        V_traj[0] = lyaloss.lyapunov.forward(x_traj[0])
-        for i in range(1, steps):
-            u = lyaloss.controller.forward(x_traj[i - 1])
-            x_traj[i] = lyaloss.dynamics.forward(x_traj[i - 1], u)
-            V_traj[i] = lyaloss.lyapunov.forward(x_traj[i])
+        if hasattr(lyaloss, 'observer') and lyaloss.observer is not None:
+            # Output feedback simulation
+            nx = lyaloss.nx
+            device = x0.device
+            dtype = x0.dtype
+            
+            # Start estimate z at equilibrium
+            try:
+                z = lyaloss.dynamics.continuous_time_system.x_equilibrium.to(device).to(dtype).repeat(x0.shape[0], 1)
+            except:
+                z = torch.zeros((x0.shape[0], nx), device=device, dtype=dtype)
+                
+            current_x = x0
+            current_z = z
+            xe = torch.cat((current_x, current_x - current_z), dim=1)
+            V_traj[0] = lyaloss.lyapunov.forward(xe)
+            
+            for i in range(1, steps):
+                y = lyaloss.observer.h(current_x)
+                ey = y - lyaloss.observer.h(current_z)
+                u = lyaloss.controller.forward(torch.cat((current_z, ey), dim=1))
+                
+                next_x = lyaloss.dynamics.forward(current_x, u)
+                next_z = lyaloss.observer.forward(current_z, u, y)
+                
+                current_x = next_x
+                current_z = next_z
+                xe = torch.cat((current_x, current_x - current_z), dim=1)
+                
+                x_traj[i] = current_x
+                V_traj[i] = lyaloss.lyapunov.forward(xe)
+        else:
+            # State feedback simulation
+            V_traj[0] = lyaloss.lyapunov.forward(x_traj[0])
+            for i in range(1, steps):
+                u = lyaloss.controller.forward(x_traj[i - 1])
+                x_traj[i] = lyaloss.dynamics.forward(x_traj[i - 1], u)
+                V_traj[i] = lyaloss.lyapunov.forward(x_traj[i])
 
     return x_traj, V_traj

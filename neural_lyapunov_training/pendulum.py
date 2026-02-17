@@ -14,17 +14,37 @@ class PendulumDynamics:
         - z: performance output (observation y = θ)
     """
 
-    def __init__(self, m: float = 1, l: float = 1, beta: float = 1, g: float = 9.81):
+    def __init__(
+        self,
+        m: float = 1,
+        l: float = 1,
+        beta: float = 1,
+        g: float = 9.81,
+        output_C: Optional[torch.Tensor] = None,
+        output_D: Optional[torch.Tensor] = None,
+    ):
         self.nx = 2
         self.nu = 1
         self.nw = 1  # Disturbance dimension (additive to u)
         self.ny = 1
-        self.nz = 1  # Performance output dimension (same as observation)
         self.m = m  # Mass
         self.l = l  # Length
         self.g = g  # Gravity
         self.beta = beta  # Damping
         self.inertia = self.m * self.l**2
+
+        # Performance output z = C_z * x + D_z * u
+        if output_C is not None:
+            self.output_C = output_C
+            self.nz = output_C.shape[0]
+        else:
+            self.output_C = torch.tensor([[1.0, 0.0]])
+            self.nz = 1
+            
+        if output_D is not None:
+            self.output_D = output_D
+        else:
+            self.output_D = torch.zeros((self.nz, self.nu))
 
     def forward(self, x: torch.Tensor, u: torch.Tensor, w: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -59,7 +79,7 @@ class PendulumDynamics:
         """
         Performance output z for dissipativity analysis.
         
-        For L2-gain analysis, z = y (observation) represents what we want to regulate.
+        z = C_z * x + D_z * u
         
         Args:
             x: state (batch, 2)
@@ -68,7 +88,7 @@ class PendulumDynamics:
         Returns:
             z: performance output (batch, nz)
         """
-        return self.h(x)
+        return x @ self.output_C.T.to(x.device, x.dtype) + u @ self.output_D.T.to(u.device, u.dtype)
 
     def linearized_dynamics(self, x, u):
         device = x.device
