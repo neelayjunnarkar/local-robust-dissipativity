@@ -149,6 +149,154 @@ class NeuralNetworkController(nn.Module):
         return self
 
 
+class LinearPlusNeuralNetworkController(nn.Module):
+    """
+    Controller with explicit linear + nonlinear decomposition:
+        u = K_linear @ x + NN_nonlinear(x)
+    
+    This structure allows:
+    1. Direct initialization of K_linear from LQR/SDP
+    2. Small initialization of NN_nonlinear (starts as perturbation)
+    3. Both components are trainable
+    
+    The linear term handles the nominal control, while the NN term
+    learns corrections for nonlinearities and saturation.
+    """
+    
+    def __init__(
+        self,
+        in_dim=2,
+        out_dim=1,
+        K_frozen=None,
+        K_trainable=None,
+        nlayer=3,
+        hidden_dim=64,
+        clip_output=None,
+        u_lo=None,
+        u_up=None,
+        x_equilibrium=None,
+        u_equilibrium=None,
+        activation=nn.Tanh,
+        nn_weight_scale=0.01,  # Scale for NN initialization
+        use_nonlinear=True,
+        *args,
+        **kwargs
+    ):
+        """
+        Args:
+            in_dim: Input dimension (state)
+            out_dim: Output dimension (control)
+            K_frozen: Frozen linear gain matrix (buffer).
+            K_trainable: Trainable linear gain matrix (parameter).
+            nlayer: Number of layers in nonlinear NN
+            hidden_dim: Hidden dimension for NN
+            clip_output: 'clamp', 'tanh', or None
+            u_lo: Lower control bound (out_dim,)
+            u_up: Upper control bound (out_dim,)
+            x_equilibrium: Equilibrium state (in_dim,)
+            u_equilibrium: Equilibrium control (out_dim,)
+            activation: Activation function for NN
+            nn_weight_scale: Scale factor for NN weight initialization
+            use_nonlinear: Whether to include the NN component
+        """
+        super().__init__(*args, **kwargs)
+        
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        assert clip_output in (None, "tanh", "clamp")
+        self.clip_output = clip_output
+        self.use_nonlinear = use_nonlinear
+        
+        # Bounds and Equilibrium
+        self.register_buffer('u_lo', u_lo) if u_lo is not None else setattr(self, 'u_lo', None)
+        self.register_buffer('u_up', u_up) if u_up is not None else setattr(self, 'u_up', None)
+        self.register_buffer('x_equilibrium', x_equilibrium) if x_equilibrium is not None else setattr(self, 'x_equilibrium', None)
+        self.register_buffer('u_equilibrium', u_equilibrium) if u_equilibrium is not None else setattr(self, 'u_equilibrium', None)
+        
+        # Linear components
+        if K_frozen is not None:
+            self.register_buffer('K_frozen', K_frozen.clone())
+        else:
+            self.K_frozen = None
+            
+        if K_trainable is not None:
+            self.K_trainable = nn.Parameter(K_trainable.clone())
+        else:
+            self.K_trainable = None
+        
+        # Nonlinear component
+        if use_nonlinear:
+            layers = [nn.Linear(in_dim, out_dim if nlayer == 1 else hidden_dim)]
+            for n in range(1, nlayer - 1):
+                layers.append(activation())
+                layers.append(nn.Linear(hidden_dim, hidden_dim))
+            if nlayer != 1:
+                layers.append(activation())
+                layers.append(nn.Linear(hidden_dim, out_dim))
+            self.nn_nonlinear = nn.Sequential(*layers)
+            
+            with torch.no_grad():
+                for layer in self.nn_nonlinear:
+                    if isinstance(layer, nn.Linear):
+                        layer.weight.data *= nn_weight_scale
+                        layer.bias.data *= nn_weight_scale
+        else:
+            self.nn_nonlinear = None
+
+    def _linear_output(self, x: torch.Tensor) -> torch.Tensor:
+        x_shifted = x - self.x_equilibrium if self.x_equilibrium is not None else x
+        u_linear = torch.zeros((x.shape[0], self.out_dim), device=x.device, dtype=x.dtype)
+        
+        if self.K_frozen is not None:
+            u_linear += torch.nn.functional.linear(x_shifted, self.K_frozen)
+        if self.K_trainable is not None:
+            u_linear += torch.nn.functional.linear(x_shifted, self.K_trainable)
+            
+        if self.u_equilibrium is not None:
+            u_linear += self.u_equilibrium
+        return u_linear
+
+    def _nonlinear_output(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.use_nonlinear or self.nn_nonlinear is None:
+            return torch.zeros((x.shape[0], self.out_dim), device=x.device, dtype=x.dtype)
+        
+        nn_output = self.nn_nonlinear(x)
+        if self.x_equilibrium is not None:
+            nn_eq = self.nn_nonlinear(self.x_equilibrium.reshape(1, -1))
+            nn_output -= nn_eq
+        return nn_output
+
+    def _unclipped_output(self, x: torch.Tensor) -> torch.Tensor:
+        return self._linear_output(x) + self._nonlinear_output(x)
+
+    def forward(self, x):
+        u = self._unclipped_output(x)
+        if self.clip_output == "clamp":
+            u = torch.max(torch.min(u, self.u_up), self.u_lo)
+        elif self.clip_output == "tanh":
+            u_mid = (self.u_up + self.u_lo) / 2
+            u_range = (self.u_up - self.u_lo) / 2
+            u = torch.tanh(u) * u_range + u_mid
+        return u
+
+    def _apply(self, fn):
+        super()._apply(fn)
+        # Parameters and buffers are handled automatically by nn.Module
+        return self
+    def _apply(self, fn):
+        """Handles CPU/GPU transfer and type conversion."""
+        super()._apply(fn)
+        if self.x_equilibrium is not None:
+            self.x_equilibrium = fn(self.x_equilibrium)
+        if self.u_equilibrium is not None:
+            self.u_equilibrium = fn(self.u_equilibrium)
+        if self.u_lo is not None:
+            self.u_lo = fn(self.u_lo)
+        if self.u_up is not None:
+            self.u_up = fn(self.u_up)
+        return self
+
+
 class NeuralNetworkLuenbergerObserver(nn.Module):
     """
     Neural network observer that takes vectors as observations.

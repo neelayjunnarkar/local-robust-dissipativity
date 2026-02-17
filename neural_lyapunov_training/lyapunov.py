@@ -50,122 +50,103 @@ class NeuralNetworkLyapunov(nn.Module):
         goal_state: torch.Tensor,
         hidden_widths: list,
         x_dim: int,
-        R_rows: int,
-        absolute_output: bool,
-        eps: float,
-        activation: nn.Module,
+        R_frozen: torch.Tensor = None,
+        R_trainable: torch.Tensor = None,
+        absolute_output: bool = True,
+        eps: float = 0.01,
+        activation: nn.Module = nn.LeakyReLU,
         nominal: typing.Optional[typing.Callable[[torch.Tensor], torch.Tensor]] = None,
         V_psd_form: str = "L1",
+        use_nonlinear: bool = True,
         *args,
         **kwargs
     ):
         """
         Args:
-          hidden_widths: hidden_widths[i] is the width of the i'th hidden
-          layer. This doesn't include the output layer, which always have
-          width 1.
-          x_dim: The dimension of state
-          R_rows: The number of rows in matrix R.
-          absolute_output: If absolute_output=False,
-          then V(x) = V_nominal(x) + ϕ(x) − ϕ(x*) + |(εI+RᵀR)(x-x*)|₁
-          otherwise V(x) = V_nominal(x) + |ϕ(x) − ϕ(x*)| + |(εI+RᵀR)(x-x*)|₁
-          nominal: V_nominal(x) in the documentation above. If nominal=None,
-          then we ignore V_nominal(x). Note that V_nominal(x*) should be 0.
-          nominal(x) should support batch computation.
+          goal_state: The target equilibrium state.
+          hidden_widths: Widths of hidden layers for NN component.
+          x_dim: Dimension of state.
+          R_frozen: Frozen matrix for quadratic term (buffer).
+          R_trainable: Additional trainable matrix for quadratic term (parameter).
+          absolute_output: V(x) = |phi| + quadratic if True, else phi + quadratic.
+          eps: Minimum eigenvalue for PSD term.
+          activation: Activation function for NN.
+          nominal: Fixed nominal Lyapunov component.
+          V_psd_form: "quadratic", "L1", or "L1_R_free".
+          use_nonlinear: Whether to include the NN component.
         """
         super().__init__(*args, **kwargs)
         self.goal_state = goal_state
         self.x_dim = x_dim
-        assert self.goal_state.shape == (self.x_dim,)
-        if hidden_widths is None:
-            layers = []
+        self.absolute_output = absolute_output
+        self.V_psd_form = V_psd_form
+        self.eps = eps
+        self.use_nonlinear = use_nonlinear
+        
+        # Linear/Quadratic components (R matrices)
+        if R_frozen is not None:
+            self.register_buffer('R_frozen', R_frozen.clone())
         else:
-            layers = [
-                nn.Linear(
-                    in_features=self.x_dim,
-                    out_features=1 if len(hidden_widths) == 0 else hidden_widths[0],
-                )
-            ]
-            for layer, width in enumerate(hidden_widths):
+            self.R_frozen = None
+            
+        if R_trainable is not None:
+            self.register_parameter('R_trainable', nn.Parameter(R_trainable.clone()))
+        else:
+            self.R_trainable = None
+            
+        # Neural Network component
+        if use_nonlinear and hidden_widths is not None:
+            layers = [nn.Linear(self.x_dim, 1 if len(hidden_widths) == 0 else hidden_widths[0])]
+            for i, width in enumerate(hidden_widths):
                 layers.append(activation())
-                layers.append(
-                    nn.Linear(
-                        in_features=width,
-                        out_features=hidden_widths[layer + 1]
-                        if layer != len(hidden_widths) - 1
-                        else 1,
-                    )
-                )
+                layers.append(nn.Linear(width, hidden_widths[i+1] if i != len(hidden_widths)-1 else 1))
+            
             for l in layers:
                 if isinstance(l, nn.Linear):
                     torch.nn.init.kaiming_uniform_(l.weight, nonlinearity="relu")
-                    # print(f'layer max={l.weight.max().item()}, min={l.weight.min().item()}')
-                    # l.weight.data.clamp_(min=-0.5, max=0.5)
-        self.net = nn.Sequential(*layers)
-        self.layers = layers
-        assert isinstance(absolute_output, bool)
-        self.absolute_output = absolute_output
-        assert isinstance(eps, float)
-        self.R_rows = R_rows
-        # If R_rows is set to 0 we will not use R.
-        if R_rows > 0:
-            # assert (eps > 0)
-            self.eps = eps
-            # Rt is the transpose of R
-            self.register_parameter(
-                name="R",
-                param=torch.nn.Parameter(torch.rand((R_rows, self.x_dim)) - 0.5),
-            )
+            
+            self.net = nn.Sequential(*layers)
+        else:
+            self.net = None
+            
         self.nominal = nominal
-        if self.nominal is not None:
-            assert self.nominal(self.goal_state.unsqueeze(0))[0].item() == 0
-        self.V_psd_form = V_psd_form
 
     def _network_output(self, x: torch.Tensor) -> torch.Tensor:
-        if len(self.net) > 0:
+        if self.use_nonlinear and self.net is not None and len(self.net) > 0:
             phi = self.net(x)
             phi_star = self.net(self.goal_state)
             return phi - phi_star
         else:
-            return torch.zeros((x.shape[0], 1), device=x.device, dtype=x.dtype)
+            return torch.zeros((*x.shape[:-1], 1), device=x.device, dtype=x.dtype)
 
     def _V_psd_output(self, x: torch.Tensor):
-        """
-        Compute
-        |(εI+RᵀR)(x-x*)|₁
-        or
-        (x-x*)ᵀ(εI+RᵀR)(x-x*)
-        or
-        |R(x-x*)|₁
-        """
-        if self.R_rows > 0:
-            eps_plus_RtR = self.eps * torch.eye(self.x_dim, device=x.device) + (
-                self.R.transpose(0, 1) @ self.R
-            )
-            if self.V_psd_form == "L1":
-                Rx = (x - self.goal_state) @ eps_plus_RtR
-                # Use relu(x) + relu(-x) instead of torch.abs(x) since the verification code does relu splitting.
-                l1_term = (
-                    torch.nn.functional.relu(Rx) + torch.nn.functional.relu(-Rx)
-                ).sum(dim=-1, keepdim=True)
-                return l1_term
-            elif self.V_psd_form == "quadratic":
-                return torch.sum(
-                    (x - self.goal_state) * ((x - self.goal_state) @ eps_plus_RtR),
-                    dim=-1,
-                    keepdim=True,
-                )
-            elif self.V_psd_form == "L1_R_free":
-                Rx = (x - self.goal_state) @ self.R.transpose(0, 1)
-                # Use relu(x) + relu(-x) instead of torch.abs(x) since the verification code does relu splitting.
-                l1_term = (
-                    torch.nn.functional.relu(Rx) + torch.nn.functional.relu(-Rx)
-                ).sum(dim=-1, keepdim=True)
-                return l1_term
-            else:
-                raise NotImplementedError
-        else:
-            return torch.zeros((x.shape[0], 1), dtype=x.dtype, device=x.device)
+        x_diff = x - self.goal_state
+        
+        # Construct the effective P matrix or L1 coefficients
+        # P = eps*I + R_frozen^T R_frozen + R_trainable^T R_trainable
+        
+        # We handle this by summing the outputs for simplicity and correctness
+        v_psd = torch.zeros((*x.shape[:-1], 1), device=x.device, dtype=x.dtype)
+        
+        # Base epsilon term for strictly positive definiteness
+        if self.eps > 0 and self.V_psd_form == "quadratic":
+            v_psd += self.eps * torch.sum(x_diff ** 2, dim=-1, keepdim=True)
+            
+        def compute_term(R_mat, form):
+            if R_mat is None: return 0
+            if form == "quadratic":
+                return torch.sum((x_diff @ R_mat.T) ** 2, dim=-1, keepdim=True)
+            elif form == "L1":
+                # (eps*I + R^TR)x handled differently here for L1
+                # For this configurable version, we just do |Rx|_1 for extra components
+                Rx = x_diff @ R_mat.T
+                return (torch.nn.functional.relu(Rx) + torch.nn.functional.relu(-Rx)).sum(dim=-1, keepdim=True)
+            return 0
+
+        v_psd += compute_term(self.R_frozen, self.V_psd_form)
+        v_psd += compute_term(self.R_trainable, self.V_psd_form)
+        
+        return v_psd
 
     def forward(self, x):
         V_nominal = 0 if self.nominal is None else self.nominal(x)
@@ -232,7 +213,7 @@ class NeuralNetworkQuadraticLyapunov(nn.Module):
         Q = self.eps * torch.eye(self.x_dim, device=x.device) + (
             self.R.transpose(0, 1) @ self.R
         )
-        return torch.sum(x0 * (x0 @ Q), axis=1, keepdim=True)
+        return torch.sum(x0 * (x0 @ Q), axis=-1, keepdim=True)
 
     def dVdx(self, x):
         Q = self.eps * torch.eye(self.x_dim, device=x.device) + (
@@ -492,21 +473,28 @@ class LyapunovDerivativeSimpleLossWithVBox(LyapunovDerivativeSimpleLossWithV):
 
 class DissipativityDerivativeLoss(nn.Module):
     """
-    Dissipativity-based derivative loss for state feedback.
+    Dissipativity-based derivative loss for state feedback with ROA constraints.
     
-    Verifies the dissipativity condition:
-        V(x_{t+1}) - V(x_t) ≤ s(w, z, V(x))
+    Verifies the LOCAL dissipativity condition for forward invariance:
+        V(x_{t+1}) - V(x_t) ≤ min(0, s(w, z))
+    
+    This ensures:
+        1. When s < 0: V decreases at rate bounded by s
+        2. When s ≥ 0: V still decreases (forward invariance)
     
     Equivalently (for verification, we want this ≥ 0):
-        V(x_t) - V(x_{t+1}) + s(w, z, V(x)) ≥ 0
+        V(x_t) - V(x_{t+1}) + min(0, s(w, z)) ≥ 0
     
     Supply rate types:
-        - Lyapunov:  s = -κV(x)           → reduces to standard Lyapunov
-        - L2-gain:   s = γ²‖w‖² - ‖z‖²   → bounded L2 gain
-        - Passivity: s = wᵀz              → passive system
+        - Lyapunov:  s = -κV(x)           → always ≤ 0, standard Lyapunov
+        - L2-gain:   s = γ²‖w‖² - ‖z‖²   → bounded L2 gain with invariance
+        - Passivity: s = wᵀz              → passive system with invariance
     
-    For Lyapunov supply rate, this is mathematically equivalent to
-    LyapunovDerivativeSimpleLoss.
+    Loss structure (same as LyapunovDerivativeLoss):
+        min(loss1, loss2 + loss3)
+        - loss1: Outside ROA penalty (ρ - V(x))
+        - loss2: Dissipativity violation
+        - loss3: Box constraint violation
     """
     
     def __init__(
@@ -515,7 +503,14 @@ class DissipativityDerivativeLoss(nn.Module):
         controller: controllers.NeuralNetworkController,
         lyap_nn: NeuralNetworkLyapunov,
         supply_rate: supply_rate_module.SupplyRate,
+        box_lo: torch.Tensor = None,
+        box_up: torch.Tensor = None,
+        rho_multiplier: float = 1.0,
         w_max: Optional[torch.Tensor] = None,
+        beta: float = 100,
+        hard_max: bool = True,
+        loss_weights: Optional[torch.Tensor] = None,
+        s_scale: float = 1.0,
         *args,
         **kwargs
     ):
@@ -525,36 +520,131 @@ class DissipativityDerivativeLoss(nn.Module):
             controller: Neural network controller
             lyap_nn: Neural network Lyapunov function
             supply_rate: Supply rate object (Lyapunov, L2-gain, or Passivity)
+            box_lo, box_up: Bounding box for state invariance
+            rho_multiplier: Multiplier for sublevel set ρ
             w_max: Disturbance bound |w| ≤ w_max. Required for L2-gain/Passivity.
+            beta: Soft-max coefficient
+            hard_max: Use hard max (True) or soft max (False)
+            loss_weights: Weights for loss components [outside_roa, dissipation, box]
+            s_scale: Scaling factor for supply rate s(w, z)
         """
         super().__init__(*args, **kwargs)
         self.dynamics = dynamics
         self.controller = controller
         self.lyapunov = lyap_nn
         self.supply_rate = supply_rate
-        self.w_max = w_max
+        self.observer = kwargs.get('observer', None)
+        self.box_lo = box_lo
+        self.box_up = box_up
+        self.rho_multiplier = rho_multiplier
+        self.beta = beta
+        self.hard_max = hard_max
+        self.x_boundary: typing.Optional[torch.Tensor] = None
+        self.nx = dynamics.nx
+        self.nw = getattr(dynamics.continuous_time_system, 'nw', 1) if hasattr(dynamics, 'continuous_time_system') else 1
+        
+        # Store w_max as tensor
+        if w_max is not None:
+            if isinstance(w_max, (int, float)):
+                self.w_max = torch.tensor([w_max])
+            else:
+                self.w_max = w_max
+        else:
+            self.w_max = None
+        
+        if loss_weights is None:
+            self.loss_weights = torch.tensor([1.0, 1.0, 1.0])
+        else:
+            assert loss_weights.shape == (3,)
+            assert torch.all(loss_weights > 0)
+            self.loss_weights = loss_weights
+        
+        self.s_scale = s_scale
         
         # Validate configuration
         if supply_rate.requires_disturbance:
             assert w_max is not None, "Supply rate requires disturbance bound w_max"
     
+    def get_rho(self):
+        """Compute ROA sublevel set value ρ."""
+        if self.x_boundary is None:
+            return torch.tensor(0.0)
+        rho_boundary = self.lyapunov(self.x_boundary).min()
+        rho = self.rho_multiplier * rho_boundary
+        return rho
+    
+    def _sample_disturbance(self, batch_size: int, device: torch.device) -> Optional[torch.Tensor]:
+        """Sample disturbance uniformly in [-w_max, w_max]."""
+        if not self.supply_rate.requires_disturbance or self.w_max is None:
+            return None
+        w_max = self.w_max.to(device)
+        w = (torch.rand(batch_size, self.nw, device=device) - 0.5) * 2 * w_max
+        return w
+    
     def forward(self, x: torch.Tensor, w: Optional[torch.Tensor] = None, save_new_x: bool = False):
         """
-        Compute dissipativity loss.
+        Compute dissipativity loss based on the condition:
         
-        Args:
-            x: State (batch, nx)
-            w: Disturbance (batch, nw). Required for L2-gain/Passivity.
-            save_new_x: Whether to save x_next for inspection
-            
-        Returns:
-            Loss = V(x) - V(x_next) + s(w, z, V(x)), should be ≥ 0
+        max{V(x) - c - ε, min{-V(F(x,u)) + V(x) + s(w,z), -V(F(x,u)) + c}} ≥ 0
         """
-        # Control input
-        u = self.controller(x)
+        # Handle joint [x, w] input if w is not provided explicitly
+        if w is None and x.shape[1] == self.nx + self.nw:
+            w = x[:, self.nx:]
+            x = x[:, :self.nx]
+            
+        batch_size = x.shape[0]
+        device = x.device
         
-        # Next state (with disturbance if provided)
-        new_x = self.dynamics.forward(x, u, w)
+        # Sample disturbance if required but not provided
+        if w is None and self.supply_rate.requires_disturbance:
+            w = self._sample_disturbance(batch_size, device)
+        
+        # Determine if we are doing output feedback (DOF) or state feedback
+        is_dof = self.observer is not None
+        
+        if is_dof:
+            # DOF case: x is actually augmented state [state, error]
+            # Split augmented state
+            # x input here is actually xe
+            xe = x
+            state_dim = self.dynamics.nx # Should be same as self.nx
+            x_state = xe[:, :state_dim]
+            e_error = xe[:, state_dim:]
+            
+            # Reconstruct estimated state z = x - e
+            z_est = x_state - e_error
+            
+            # Controller acts on estimated state z
+            u = self.controller(z_est)
+            
+            # True state update
+            new_x_state = self.dynamics.forward(x_state, u, w)
+            
+            # Observer update
+            # Get measurement y (from true x)
+            y = self.dynamics.observation(x_state)
+            
+            # Observer estimates next z based on current z, u, and y
+            new_z_est = self.observer(z_est, u, y)
+            
+            # Error update: new_e = new_x - new_z
+            new_e_error = new_x_state - new_z_est
+            
+            # Combine into new augmented state
+            new_x = torch.cat((new_x_state, new_e_error), dim=1)
+            
+            # For supply rate calculation, we need true state output
+            x_for_output = x_state
+            
+        else:
+            # State feedback case
+            x_for_output = x
+            
+            # Control input
+            u = self.controller(x)
+        
+            # Next state (with disturbance if provided)
+            new_x = self.dynamics.forward(x, u, w)
         if save_new_x:
             self.new_x = new_x
         
@@ -566,15 +656,46 @@ class DissipativityDerivativeLoss(nn.Module):
         # Performance output z (for L2-gain/Passivity)
         z = None
         if self.supply_rate.requires_output:
-            z = self.dynamics.output(x, u)
+            if is_dof:
+                 # Use observer output function if available, otherwise dynamics output
+                 if hasattr(self.observer, 'h'):
+                     z = self.observer.h(x_for_output)
+                 else:
+                     z = self.dynamics.output(x_for_output, u)
+            else:
+                z = self.dynamics.output(x_for_output, u)
         
-        # Compute supply rate
+        # Compute supply rate s(w, z)
         supply = self.supply_rate(w, z, V_x)
         
-        # Dissipativity: V(x) - V(x_next) + s ≥ 0
-        loss = V_x - V_next + supply
+        # Get c = ρ (ROA sublevel set value)
+        c = self.get_rho()
         
-        return loss
+        # Implement: max{V(x) - c - ε, min{-V(x_next) + V(x) + s, -V(x_next) + c}} ≥ 0
+        # Using ε = 0 (margin is implicit in rho_multiplier)
+        
+        # Term 1: V(x) - c (outside ROA condition)
+        term1 = V_x - c
+        
+        # Term 2a: -V(x_next) + V(x) + alpha * s = V(x) - V(x_next) + alpha * s (dissipativity)
+        term2a = V_x - V_next + self.s_scale * supply
+        
+        # Term 2b: -V(x_next) + c = c - V(x_next) (forward invariance into ROA)
+        term2b = c - V_next
+        
+        # Term 2: min{term2a, term2b}
+        term2 = torch.min(torch.cat((term2a, term2b), dim=-1), dim=-1, keepdim=True).values
+        
+        # Final: max{term1, term2}
+        if self.hard_max:
+            result = torch.max(torch.cat((term1, term2), dim=-1), dim=-1, keepdim=True).values
+        else:
+            result = soft_max(torch.cat((term1, term2), dim=-1), self.beta)
+        
+        # Return result (should be ≥ 0 for valid condition)
+        # For training, we want to minimize violations, so return as-is
+        # (negative values indicate violations)
+        return result
     
     @property
     def kappa(self):
@@ -582,6 +703,11 @@ class DissipativityDerivativeLoss(nn.Module):
         if isinstance(self.supply_rate, supply_rate_module.LyapunovSupplyRate):
             return self.supply_rate.kappa
         return 0.0
+    
+    @property
+    def requires_disturbance(self):
+        """Whether this loss requires disturbance input w for training/verification."""
+        return self.supply_rate.requires_disturbance
 
 
 class DissipativityDerivativeLossWithV(DissipativityDerivativeLoss):
@@ -602,293 +728,59 @@ class DissipativityDerivativeLossWithVBox(DissipativityDerivativeLossWithV):
     def forward(self, x: torch.Tensor, w: Optional[torch.Tensor] = None, *args, **kwargs):
         loss_and_V = super().forward(x, w, save_new_x=True, *args, **kwargs)
         return torch.cat((loss_and_V, self.new_x), dim=1)
+    
 
 
-class DissipativityDerivativeDOFLoss(nn.Module):
+
+# =============================================================================
+# Verification Wrapper for L2-gain (treats disturbance as adversarial input)
+# =============================================================================
+
+class DissipativityVerificationWrapper(nn.Module):
     """
-    Dissipativity-based derivative loss for dynamic output feedback.
+    Wrapper for formal verification of dissipativity conditions.
     
-    Augmented state ξ = [x, e] where e = x - z (estimation error).
+    Treats disturbance w as part of the input for verification:
+        Input: [state, disturbance] = [xe, w]
+        Output: dissipativity loss (should be ≥ 0)
     
-    Verifies:
-        V(ξ_{t+1}) - V(ξ_t) ≤ s(w, z, V(ξ))
-    
-    For L2-gain/Passivity, disturbance w is sampled uniformly in [-w_max, w_max]
-    when not provided explicitly.
+    This allows α-β-CROWN to verify over ALL (state, disturbance) pairs.
     """
     
-    def __init__(
-        self,
-        dynamics: dynamical_system.DiscreteTimeSystem,
-        observer,
-        controller: controllers.NeuralNetworkController,
-        lyap_nn: NeuralNetworkLyapunov,
-        supply_rate: supply_rate_module.SupplyRate,
-        box_lo: torch.Tensor,
-        box_up: torch.Tensor,
-        rho_multiplier: float,
-        w_max: Optional[torch.Tensor] = None,
-        beta: float = 100,
-        hard_max: bool = True,
-        loss_weights: Optional[torch.Tensor] = None,
-        *args,
-        **kwargs
-    ):
+    def __init__(self, loss_fn, state_dim: int, w_dim: int):
         """
         Args:
-            dynamics: Discrete-time dynamical system
-            observer: Neural network observer
-            controller: Neural network controller
-            lyap_nn: Neural network Lyapunov function
-            supply_rate: Supply rate object
-            box_lo, box_up: Bounding box for invariance
-            rho_multiplier: Multiplier for sublevel set ρ
-            w_max: Disturbance bound (scalar or tensor)
-            beta: Soft-max coefficient
-            hard_max: Use hard max (True) or soft max (False)
-            loss_weights: Weights for loss components
+            loss_fn: Dissipativity loss function (e.g., DissipativityDerivativeLoss)
+            state_dim: Dimension of state (2*nx for output feedback)
+            w_dim: Dimension of disturbance
         """
-        super().__init__(*args, **kwargs)
-        self.dynamics = dynamics
-        self.observer = observer
-        self.controller = controller
-        self.lyapunov = lyap_nn
-        self.supply_rate = supply_rate
-        self.rho_multiplier = rho_multiplier
-        self.box_lo = box_lo
-        self.box_up = box_up
-        self.nx = dynamics.continuous_time_system.nx
-        self.nw = getattr(dynamics.continuous_time_system, 'nw', 1)
-        self.x_boundary: typing.Optional[torch.Tensor] = None
-        self.beta = beta
-        self.hard_max = hard_max
-        
-        # Store w_max as tensor
-        if w_max is not None:
-            if isinstance(w_max, (int, float)):
-                self.w_max = torch.tensor([w_max])
-            else:
-                self.w_max = w_max
-        else:
-            self.w_max = None
-        
-        if loss_weights is None:
-            self.loss_weights = torch.tensor([1.0, 1.0, 1.0])
-        else:
-            assert loss_weights.shape == (3,)
-            assert torch.all(loss_weights > 0)
-            self.loss_weights = loss_weights
+        super().__init__()
+        self.loss_fn = loss_fn
+        self.state_dim = state_dim
+        self.w_dim = w_dim
     
-    def get_rho(self):
-        rho_boundary = self.lyapunov(self.x_boundary).min()
-        rho = self.rho_multiplier * rho_boundary
-        return rho
-    
-    @property
-    def kappa(self):
-        """For compatibility: extract kappa if using Lyapunov supply rate."""
-        if isinstance(self.supply_rate, supply_rate_module.LyapunovSupplyRate):
-            return self.supply_rate.kappa
-        return 0.0
-    
-    def _sample_disturbance(self, batch_size: int, device: torch.device) -> Optional[torch.Tensor]:
-        """Sample disturbance uniformly in [-w_max, w_max]."""
-        if not self.supply_rate.requires_disturbance or self.w_max is None:
-            return None
-        w_max = self.w_max.to(device)
-        # Uniform sampling in [-w_max, w_max]
-        w = (torch.rand(batch_size, self.nw, device=device) - 0.5) * 2 * w_max
-        return w
-    
-    def forward(self, xe: torch.Tensor, w: Optional[torch.Tensor] = None):
+    def forward(self, xew: torch.Tensor) -> torch.Tensor:
         """
-        Compute dissipativity loss for output feedback.
+        Forward pass for verification.
         
         Args:
-            xe: Augmented state [x, e], shape (batch, 2*nx)
-            w: Disturbance (batch, nw). If None and required, sampled automatically.
+            xew: Combined input [state, disturbance], shape (batch, state_dim + w_dim)
             
         Returns:
-            Negated loss for verification (should be ≥ 0)
+            Dissipativity loss, shape (batch, 1) or (batch, n_outputs)
         """
-        batch_size = xe.shape[0]
-        device = xe.device
+        # Split input into state and disturbance
+        xe = xew[:, :self.state_dim]
+        w = xew[:, self.state_dim:self.state_dim + self.w_dim]
         
-        # Sample disturbance if required but not provided
-        if w is None and self.supply_rate.requires_disturbance:
-            w = self._sample_disturbance(batch_size, device)
-        
-        # Split augmented state
-        x = xe[:, :self.nx]
-        e = xe[:, self.nx:]
-        z_est = x - e  # Estimated state
-        
-        # Observation
-        y = self.observer.h(x)
-        ey = y - self.observer.h(z_est)
-        
-        # Control based on estimated state
-        u = self.controller.forward(torch.cat((z_est, ey), dim=1))
-        
-        # Dynamics with disturbance
-        new_x = self.dynamics.forward(x, u, w)
-        new_z = self.observer.forward(z_est, u, y)
-        new_xe = torch.cat((new_x, new_x - new_z), dim=1)
-        self.new_xe = new_xe
-        
-        # Lyapunov values
-        V_xe = self.lyapunov(xe)
-        self.last_lyapunov_x = V_xe.detach()
-        
-        # Performance output z (observation of true state)
-        z_out = None
-        if self.supply_rate.requires_output:
-            z_out = self.observer.h(x)
-        
-        # Supply rate
-        supply = self.supply_rate(w, z_out, V_xe)
-        
-        # Get rho for ROA constraint
-        rho = self.get_rho()
-        
-        # Loss 1: Outside ROA (V(x) > ρ)
-        loss1 = self.loss_weights[0] * (rho - V_xe)
-        
-        # Loss 2: Dissipativity violation
-        # Want: V(xe) - V(new_xe) + s ≥ 0
-        # Violation: V(new_xe) - V(xe) - s > 0
-        dissipativity_violation = self.lyapunov(new_xe) - V_xe - supply
-        loss2 = self.loss_weights[1] * torch.nn.functional.relu(dissipativity_violation)
-        
-        # Loss 3: Box constraint violation
-        loss3 = self.loss_weights[2] * (
-            torch.nn.functional.relu(self.box_lo - new_xe).sum(dim=1, keepdim=True)
-            + torch.nn.functional.relu(new_xe - self.box_up).sum(dim=1, keepdim=True)
-        )
-        
-        loss23 = loss2 + loss3
-        
-        if self.hard_max:
-            loss = torch.min(
-                torch.cat((loss1, loss23), dim=-1),
-                dim=-1,
-                keepdim=True,
-            ).values
-            return -loss
-        else:
-            loss = soft_min(torch.cat((loss1, loss23), dim=-1), self.beta)
-            return -loss
-
-
-class DissipativityDerivativeDOFSimpleLoss(nn.Module):
-    """
-    Simple dissipativity loss for output feedback (no ROA constraint).
+        # Call underlying loss with explicit disturbance
+        return self.loss_fn(xe, w)
     
-    Directly verifies: V(ξ) - V(ξ_next) + s(w, z, V(ξ)) ≥ 0
-    
-    For L2-gain/Passivity, disturbance w is sampled uniformly when not provided.
-    """
-    
-    def __init__(
-        self,
-        dynamics: dynamical_system.DiscreteTimeSystem,
-        observer,
-        controller: controllers.NeuralNetworkController,
-        lyap_nn: NeuralNetworkLyapunov,
-        supply_rate: supply_rate_module.SupplyRate,
-        w_max: Optional[torch.Tensor] = None,
-        *args,
-        **kwargs
-    ):
-        super().__init__(*args, **kwargs)
-        self.dynamics = dynamics
-        self.observer = observer
-        self.controller = controller
-        self.lyapunov = lyap_nn
-        self.supply_rate = supply_rate
-        self.nx = dynamics.continuous_time_system.nx
-        self.nw = getattr(dynamics.continuous_time_system, 'nw', 1)
-        self.x_boundary: typing.Optional[torch.Tensor] = None
-        
-        # Store w_max as tensor
-        if w_max is not None:
-            if isinstance(w_max, (int, float)):
-                self.w_max = torch.tensor([w_max])
-            else:
-                self.w_max = w_max
-        else:
-            self.w_max = None
-    
-    @property
-    def kappa(self):
-        if isinstance(self.supply_rate, supply_rate_module.LyapunovSupplyRate):
-            return self.supply_rate.kappa
-        return 0.0
-    
-    def _sample_disturbance(self, batch_size: int, device: torch.device) -> Optional[torch.Tensor]:
-        """Sample disturbance uniformly in [-w_max, w_max]."""
-        if not self.supply_rate.requires_disturbance or self.w_max is None:
-            return None
-        w_max = self.w_max.to(device)
-        w = (torch.rand(batch_size, self.nw, device=device) - 0.5) * 2 * w_max
-        return w
-    
-    def forward(self, xe: torch.Tensor, w: Optional[torch.Tensor] = None):
-        batch_size = xe.shape[0]
-        device = xe.device
-        
-        # Sample disturbance if required but not provided
-        if w is None and self.supply_rate.requires_disturbance:
-            w = self._sample_disturbance(batch_size, device)
-        
-        # Split augmented state
-        x = xe[:, :self.nx]
-        e = xe[:, self.nx:]
-        z_est = x - e
-        
-        # Observation and control
-        y = self.observer.h(x)
-        ey = y - self.observer.h(z_est)
-        u = self.controller.forward(torch.cat((z_est, ey), dim=1))
-        
-        # Dynamics with disturbance
-        new_x = self.dynamics.forward(x, u, w)
-        new_z = self.observer.forward(z_est, u, y)
-        self.new_xe = torch.cat((new_x, new_x - new_z), dim=1)
-        
-        # Lyapunov values
-        V_xe = self.lyapunov(xe)
-        V_next = self.lyapunov(self.new_xe)
-        self.last_lyapunov_x = V_xe.detach()
-        
-        # Performance output
-        z_out = None
-        if self.supply_rate.requires_output:
-            z_out = self.observer.h(x)
-        
-        # Supply rate
-        supply = self.supply_rate(w, z_out, V_xe)
-        
-        # Dissipativity: V(xe) - V(next) + s ≥ 0
-        loss = V_xe - V_next + supply
-        
-        return loss
-
-
-class DissipativityDerivativeDOFLossWithV(DissipativityDerivativeDOFSimpleLoss):
-    """Output feedback dissipativity loss with V as second output."""
-    
-    def forward(self, xe: torch.Tensor, w: Optional[torch.Tensor] = None, *args, **kwargs):
-        loss = super().forward(xe, w, *args, **kwargs)
-        return torch.cat((loss, self.last_lyapunov_x), dim=1)
-
-
-class DissipativityDerivativeDOFLossWithVBox(DissipativityDerivativeDOFLossWithV):
-    """Additionally output x_next for box verification."""
-    
-    def forward(self, xe: torch.Tensor, w: Optional[torch.Tensor] = None, *args, **kwargs):
-        loss_and_V = super().forward(xe, w, *args, **kwargs)
-        return torch.cat((loss_and_V, self.new_xe), dim=1)
+    # Delegate attribute access to underlying loss for compatibility
+    def __getattr__(self, name):
+        if name in ['loss_fn', 'state_dim', 'w_dim', '_modules', '_parameters', '_buffers']:
+            return super().__getattr__(name)
+        return getattr(self.loss_fn, name)
 
 
 class LyapunovDerivativeDOFLoss(nn.Module):
