@@ -1,7 +1,8 @@
 run_dir: ./output/pendulum_state/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
-wandb_enabled: False 
-wandb_entity: ??? 
+wandb_enabled: True 
+wandb_entity: NN-verification  # Wandb team name 
+wandb_project: pendulum_state_training_2
 
 load_lyaloss: examples/data/pendulum/state_feedback/lyaloss_init.pth
 Vmin_x_pgd_path: null 

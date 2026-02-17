@@ -1,7 +1,8 @@
 run_dir: ./output/pendulum_output/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
-wandb_enabled: False 
-wandb_entity: ??? 
+wandb_enabled: True 
+wandb_entity: NN-verification  # Wandb team name 
+wandb_project: neural_lyapunov_training
 
 load_lyaloss: null
 Vmin_x_pgd_path: null 
