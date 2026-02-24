@@ -1,0 +1,126 @@
+wandb_name: pendulum_state_ltic_v1
+defaults:
+  - user: pendulum_state_training_default
+  - train_template
+
+hydra:
+  run:
+    dir: ${user.run_dir}
+  sweep:
+    dir: ${user.run_dir}
+
+use_sdp_init: False
+approximate_lqr: False
+
+# Verify the initial (untrained) model and compare with trained result
+verify_init: True
+
+supply_rate:
+  type: l2gain
+  gamma: 10
+  w_max: 0.024525
+pgd_verifier_steps: 300
+pgd_verifier_num_seeds: 5
+pgd_verifier_stop_early: False
+
+model:
+  normalize_coordinates: False
+
+  # Full augmented 4×4 Lyapunov matrix P — used directly as R_trainable init.
+  # Dimensions: [x_p (2), x_k (2)]
+  P_init: [[ 0.7114,  0.0546,  0.0100, -0.0020],
+           [ 0.0546,  0.0520, -0.0045,  0.0020],
+           [ 0.0100, -0.0045,  0.4106,  0.0076],
+           [-0.0020,  0.0020,  0.0076,  0.5623]]
+
+  K_init: null   # Not used for LTIC
+
+  # Performance output z = C_z * x_p   (full pendulum state, nz=2)
+  # L2-gain supply rate: V⁺ - V + ||z||² - γ²||w||²
+  output_C: [[1.0, 0.0],
+             [0.0, 1.0]]
+  # output_D defaults to zeros(nz, nu) = zeros(2, 1)
+
+  controller:
+    type: ltic
+
+    # ================================================================
+    # LTI Dynamic Controller — continuous-time matrices.
+    # Euler-discretised internally at dt.
+    #   ẋ_k = A_k x_k + B_k y,   y = x_p  (full-state feedback)
+    #   u   = C_k x_k + D_k y
+    # ================================================================
+    ltic:
+      n_k: 2
+
+      A_k: [[-0.0484,  0.0309],
+            [ 0.0264, -0.0183]]
+      B_k: [[-0.0827,  0.0273],
+            [ 0.0413, -0.0170]]
+      C_k: [[-0.0103,  0.0038]]
+      D_k: [[-2.7682, -2.1447]]
+
+      # Sampling limits for controller state x_k.
+      controller_limit: [1, 1]
+
+      trainable: False
+
+  lyapunov:
+    use_frozen_quadratic: False
+    use_trainable_quadratic: True
+    use_nonlinear: False
+    activation: leaky_relu
+    hidden_widths: [32, 32]
+
+  V_decrease_within_roa: True
+
+  limit_scale: [1]
+  domain_init_scale: 0.05
+  V_psd_form: "quadratic"
+  rho_multiplier: [1]
+  limit: [1.6, 6]   # plant-state limits; controller limits in ltic.controller_limit
+
+  dt: 0.01
+  velocity_integration: "ExplicitEuler"
+  position_integration: "MidPoint"
+
+  controller_nlayer: 2
+  controller_hidden_dim: 32
+  u_max: 0.24525
+
+train:
+  train_lyaloss: True
+  hard_max: True
+  num_samples_per_boundary: 1024
+
+  batch_size: 2048
+  epochs: 200
+  learning_rate: 1e-3
+  pgd_steps: 200
+  Vmin_x_pgd_buffer_size: 32768
+  buffer_size: 8192
+  samples_per_iter: 4096
+
+  max_iter: [200]
+
+  zubov_sampling: False
+  zubov_num_bands: 5
+  zubov_pgd_steps: 100
+  zubov_step_size: 0.01
+
+  # dt=0.01 → 4000 steps for ~40s simulation (same wall-clock as dt=0.05 / 800 steps)
+  domain_expansion: True
+  domain_update_interval: 500
+  domain_traj_steps: 2000
+  domain_num_trajectories: 10000
+  domain_convergence_thresh: 0.01
+  domain_max_growth: 1.5
+
+loss:
+  s_scale: 1
+  candidate_roa_states_weight: 0
+  l1_reg: 1e-5
+  # Plant-state only — controller dims auto-padded with zeros.
+  candidate_roa_states:
+    - [0, 0]
+  always_candidate_roa_regulizer: False

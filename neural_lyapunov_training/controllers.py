@@ -297,6 +297,116 @@ class LinearPlusNeuralNetworkController(nn.Module):
         return self
 
 
+class LTIDynamicController(nn.Module):
+    """
+    Linear Time-Invariant Dynamic Output-Feedback Controller.
+
+    Continuous-time formulation::
+
+        ẋ_k = A_k x_k + B_k y
+        u   = C_k x_k + D_k y
+
+    Stored internally in discrete-time (Euler discretisation)::
+
+        x_k[t+1] = Ā_k x_k[t] + B̄_k y[t]    (Ā_k = I + dt·A_k,  B̄_k = dt·B_k)
+        u[t]     = C_k x_k[t] + D_k y[t]
+
+    The controller operates on augmented state ξ = [x_p, x_k] where x_p is
+    the plant state (dim n_p) and x_k is the controller internal state (dim n_k).
+
+    * ``forward(ξ)`` → u   (called by the loss's ``self.controller(x)``).
+    * ``evolve_state(x_k, y)`` → x_k_next  (called by the augmented dynamics).
+
+    Output equation:  y = output_fn(x_p).  Default (None) means y = x_p.
+
+    When ``trainable=False`` matrices are stored as buffers (frozen).
+    When ``trainable=True`` matrices are ``nn.Parameter`` s (optimised).
+    """
+
+    def __init__(
+        self,
+        A_k: torch.Tensor,
+        B_k: torch.Tensor,
+        C_k: torch.Tensor,
+        D_k: torch.Tensor,
+        n_plant: int,
+        dt: float,
+        output_fn: nn.Module = None,
+        trainable: bool = False,
+        clip_output: str = None,
+        u_lo: torch.Tensor = None,
+        u_up: torch.Tensor = None,
+    ):
+        """
+        Args:
+            A_k: (n_k, n_k) continuous-time controller state matrix.
+            B_k: (n_k, n_y) continuous-time controller input matrix.
+            C_k: (n_u, n_k) controller output matrix.
+            D_k: (n_u, n_y) controller feed-through matrix.
+            n_plant: dimension of the plant state x_p.
+            dt: discretisation time step (same as plant dynamics).
+            output_fn: nn.Module mapping x_p → y.  None means y = x_p.
+            trainable: if True all matrices become nn.Parameters.
+            clip_output: ``'clamp'`` or ``None``.
+            u_lo, u_up: control bounds (used when ``clip_output='clamp'``).
+        """
+        super().__init__()
+        n_k = A_k.shape[0]
+        self.n_k = n_k
+        self.n_plant = n_plant
+        self.dt = dt
+        self.output_fn = output_fn
+        self.clip_output = clip_output
+
+        # Discretise: Ā = I + dt·A,  B̄ = dt·B
+        A_kd = torch.eye(n_k, dtype=A_k.dtype) + dt * A_k
+        B_kd = dt * B_k
+
+        def _store(name, tensor):
+            if trainable:
+                self.register_parameter(name, nn.Parameter(tensor.clone()))
+            else:
+                self.register_buffer(name, tensor.clone())
+
+        _store('A_kd', A_kd)
+        _store('B_kd', B_kd)
+        _store('C_k', C_k)
+        _store('D_k', D_k)
+
+        if u_lo is not None:
+            self.register_buffer('u_lo', u_lo.clone())
+        else:
+            self.u_lo = None
+        if u_up is not None:
+            self.register_buffer('u_up', u_up.clone())
+        else:
+            self.u_up = None
+
+    # -- helpers -------------------------------------------------------
+
+    def _get_y(self, x_p: torch.Tensor) -> torch.Tensor:
+        """Plant output from plant state."""
+        if self.output_fn is not None:
+            return self.output_fn(x_p)
+        return x_p
+
+    # -- public API ----------------------------------------------------
+
+    def forward(self, xi: torch.Tensor) -> torch.Tensor:
+        """Compute control u from augmented state ξ = [x_p, x_k]."""
+        x_p = xi[:, :self.n_plant]
+        x_k = xi[:, self.n_plant:]
+        y = self._get_y(x_p)
+        u = x_k @ self.C_k.T + y @ self.D_k.T
+        if self.clip_output == 'clamp' and self.u_lo is not None:
+            u = torch.max(torch.min(u, self.u_up), self.u_lo)
+        return u
+
+    def evolve_state(self, x_k: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Discrete-time controller state update: x_k+ = Ā_k x_k + B̄_k y."""
+        return x_k @ self.A_kd.T + y @ self.B_kd.T
+
+
 class NeuralNetworkLuenbergerObserver(nn.Module):
     """
     Neural network observer that takes vectors as observations.

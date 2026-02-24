@@ -263,3 +263,81 @@ class NormalizedDynamicsWrapper(DiscreteTimeSystem):
     @property
     def u_equilibrium(self):
         return self.inner.u_equilibrium
+
+
+class AugmentedLTICDynamics(DiscreteTimeSystem):
+    """
+    Augmented dynamics that evolves both plant and LTI controller states
+    as a single higher-dimensional system.
+
+    Augmented state  ξ = [x_p, x_k]  (dim = n_p + n_k).
+
+    Given control u (computed externally by ``LTIDynamicController.forward``):
+
+    * **Plant**:      x_p⁺ = plant_dynamics(x_p, u, w)
+    * **Controller**: x_k⁺ = Ā_k x_k + B̄_k y ,  y = output_fn(x_p)
+
+    The controller matrices (Ā_k, B̄_k) live inside the ``LTIDynamicController``
+    instance and are shared with the controller forward pass so gradients flow
+    through both paths when the matrices are trainable.
+
+    Drop-in ``DiscreteTimeSystem`` — existing loss functions, PGD, sampling,
+    domain expansion, and verification all work unchanged on ξ.
+    """
+
+    def __init__(self, plant_dynamics: DiscreteTimeSystem, ltic_controller):
+        """
+        Args:
+            plant_dynamics: original plant ``DiscreteTimeSystem``.
+            ltic_controller: ``LTIDynamicController`` instance.
+        """
+        super().__init__(
+            nx=plant_dynamics.nx + ltic_controller.n_k,
+            nu=plant_dynamics.nu,
+        )
+        self.plant = plant_dynamics
+        self.ltic = ltic_controller
+        self.n_plant = plant_dynamics.nx
+        self.n_k = ltic_controller.n_k
+        self.dt = plant_dynamics.dt
+        self.nw = getattr(plant_dynamics, 'nw', 0)
+        if hasattr(plant_dynamics, 'continuous_time_system'):
+            self.continuous_time_system = plant_dynamics.continuous_time_system
+
+    def forward(self, xi, u, w=None):
+        """
+        Evolve augmented state one time-step.
+
+        Args:
+            xi: (batch, n_plant + n_k) augmented state.
+            u:  (batch, n_u) control.
+            w:  (batch, n_w) or None disturbance.
+        """
+        x_p = xi[:, :self.n_plant]
+        x_k = xi[:, self.n_plant:]
+        y = self.ltic._get_y(x_p)
+
+        if w is not None:
+            x_p_next = self.plant.forward(x_p, u, w)
+        else:
+            x_p_next = self.plant.forward(x_p, u)
+
+        x_k_next = self.ltic.evolve_state(x_k, y)
+
+        return torch.cat([x_p_next, x_k_next], dim=1)
+
+    def output(self, xi, u):
+        """Performance output — delegates to plant dynamics."""
+        x_p = xi[:, :self.n_plant]
+        return self.plant.output(x_p, u)
+
+    @property
+    def x_equilibrium(self):
+        """Equilibrium of augmented system: [x_p*, 0_k]."""
+        x_p_eq = self.plant.x_equilibrium
+        x_k_eq = torch.zeros(self.n_k, device=x_p_eq.device, dtype=x_p_eq.dtype)
+        return torch.cat([x_p_eq, x_k_eq])
+
+    @property
+    def u_equilibrium(self):
+        return self.plant.u_equilibrium
