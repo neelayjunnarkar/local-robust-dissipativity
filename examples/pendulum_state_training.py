@@ -21,19 +21,8 @@ import neural_lyapunov_training.dynamical_system as dynamical_system
 import neural_lyapunov_training.lyapunov as lyapunov
 import neural_lyapunov_training.models as models
 import neural_lyapunov_training.pendulum as pendulum
-import neural_lyapunov_training.train_utils as train_utils
 import neural_lyapunov_training.supply_rate as supply_rate_module
-
-# Import crown-dissipativity SDP initialization
-try:
-    from neural_lyapunov_training.crown_sdp_init import (
-        compute_l2gain_init_pendulum,
-        approximate_with_nn,
-        CROWN_SDP_AVAILABLE
-    )
-except ImportError:
-    CROWN_SDP_AVAILABLE = False
-    print("Warning: crown-dissipativity SDP initialization not available")
+import neural_lyapunov_training.train_utils as train_utils
 
 device = torch.device("cpu")
 dtype = torch.float
@@ -73,6 +62,196 @@ def get_w_max(cfg):
         if w_max is not None:
             return torch.tensor([w_max])
     return None
+
+
+@torch.no_grad()
+def diagnose_adversarial_examples(
+    examples,          # list of lists/tensors, each [x1, ..., xn, w1, ..., wm]
+    lyapunov_nn,
+    dynamics,
+    controller,
+    supply_rate_fn,
+    s_scale: float,
+    rho: float,        # verified rho (= levelset c)
+    nx: int,
+    logger,
+    label: str = "",
+):
+    """Print detailed diagnostics for user-specified adversarial [x, w] examples."""
+    if not examples:
+        return
+    c = rho
+    is_l2 = isinstance(supply_rate_fn, supply_rate_module.L2GainSupplyRate)
+    header = f"ADVERSARIAL EXAMPLE DIAGNOSTICS ({label})" if label else "ADVERSARIAL EXAMPLE DIAGNOSTICS"
+    logger.info("=" * 70)
+    logger.info(header)
+    logger.info(f"  rho (c) = {c}")
+    logger.info("=" * 70)
+
+    for i, ex in enumerate(examples):
+        ex_t = torch.tensor(ex, dtype=torch.float).unsqueeze(0)  # (1, nx+nw)
+        x = ex_t[:, :nx]
+        w = ex_t[:, nx:] if ex_t.shape[1] > nx else None
+
+        # V(x)
+        V_x = lyapunov_nn(x)
+
+        # Controller output
+        u = controller(x)
+
+        # Next state
+        x_next = dynamics.forward(x, u, w)
+
+        # V(x_next)
+        V_next = lyapunov_nn(x_next)
+
+        # Performance output z
+        z = dynamics.output(x, u)
+
+        # Supply rate
+        if w is not None:
+            s = supply_rate_fn(w, z, V_x)
+        else:
+            s = supply_rate_fn(None, z, V_x)
+
+        logger.info(f"--- Example {i} ---")
+        logger.info(f"  x     = {x.squeeze(0).tolist()}")
+        if w is not None:
+            logger.info(f"  w     = {w.squeeze(0).tolist()}")
+        logger.info(f"  u     = {u.squeeze(0).tolist()}")
+        logger.info(f"  x_next= {x_next.squeeze(0).tolist()}")
+
+        in_set = -V_x + c
+        logger.info(f"  in set:    -V(x) + c = {in_set.item():.6e}  "
+                     f"(V(x)={V_x.item():.6e}, c={c:.6e})")
+
+        still_in = -V_next + c
+        logger.info(f"  still in:  -V(F(x,d)) + c = {still_in.item():.6e}  "
+                     f"(V(F)={V_next.item():.6e}, c={c:.6e})")
+
+        V_decrease = V_x - V_next
+        dissip = V_x - V_next + s_scale * s
+        logger.info(f"  dissipativ: V(x)-V(F)+s_scale*s = {dissip.item():.6e}  "
+                     f"(V(x)={V_x.item():.6e}, V(F)={V_next.item():.6e}, "
+                     f"s_scale*s={( s_scale * s).item():.6e})")
+
+        if is_l2:
+            gamma = supply_rate_fn.gamma
+            w_norm_sq = (w ** 2).sum(dim=-1, keepdim=True) if w is not None else torch.tensor([[0.0]])
+            z_norm_sq = (z ** 2).sum(dim=-1, keepdim=True)
+            logger.info(f"  perf_out z = {z.squeeze(0).tolist()}, 1/gamma^2 = {(1/gamma)**2:.6e}")
+            logger.info(f"  supply: ||w||^2 - 1/gamma^2 ||z||^2 = {s.item():.6e}  "
+                         f"(||w||^2={w_norm_sq.item():.6e}, "
+                         f"1/g^2*||z||^2={((1/gamma)**2 * z_norm_sq).item():.6e})")
+
+        logger.info(f"  V decrease: V(x)-V(F) = {V_decrease.item():.6e}")
+
+        # Verdict
+        violated = []
+        if in_set.item() < 0:
+            violated.append("NOT in sublevel set")
+        if still_in.item() < 0:
+            violated.append("x_next NOT in sublevel set")
+        if dissip.item() < 0:
+            violated.append("DISSIPATIVITY VIOLATED")
+        if violated:
+            logger.warning(f"  >> VIOLATIONS: {', '.join(violated)}")
+        else:
+            logger.info(f"  >> ALL CONDITIONS SATISFIED")
+    logger.info("=" * 70)
+
+
+@torch.no_grad()
+def sample_init_roa_anchors(
+    lyapunov_nn,
+    init_rho: float,
+    lower_limit: torch.Tensor,
+    upper_limit: torch.Tensor,
+    nx: int,
+    num_anchors: int = 256,
+    expand_factor: float = 1.5,
+    num_candidates: int = 500_000,
+    logger=None,
+) -> torch.Tensor:
+    """
+    Sample anchor points from the initial verified ROA for growth incentive.
+
+    Returns points in two bands:
+      - Boundary band:  V₀(x) ∈ [0.7·ρ₀, ρ₀]       (anchors — prevent shrinking)
+      - Beyond band:    V₀(x) ∈ [ρ₀, α·ρ₀]          (stretch goals — push growth)
+
+    Half the budget goes to each band; shortfall is filled from the other.
+    """
+    device = lower_limit.device
+    n_bdry = num_anchors // 2
+    n_beyond = num_anchors - n_bdry
+
+    # Uniform samples in the box
+    x_cand = (
+        torch.rand(num_candidates, nx, device=device)
+        * (upper_limit - lower_limit)
+        + lower_limit
+    )
+    V_vals = lyapunov_nn(x_cand).squeeze(-1)
+
+    # Boundary band: V ∈ [0.7ρ, ρ]
+    bdry_mask = (V_vals >= 0.7 * init_rho) & (V_vals <= init_rho)
+    bdry_pts = x_cand[bdry_mask]
+
+    # Beyond band: V ∈ [ρ, α·ρ]
+    beyond_mask = (V_vals > init_rho) & (V_vals <= expand_factor * init_rho)
+    beyond_pts = x_cand[beyond_mask]
+
+    # Fill each band up to budget; overflow goes to the other band
+    if bdry_pts.shape[0] > n_bdry:
+        idx = torch.randperm(bdry_pts.shape[0])[:n_bdry]
+        bdry_pts = bdry_pts[idx]
+    if beyond_pts.shape[0] > n_beyond:
+        idx = torch.randperm(beyond_pts.shape[0])[:n_beyond]
+        beyond_pts = beyond_pts[idx]
+
+    anchors = torch.cat([bdry_pts, beyond_pts], dim=0)
+
+    # If we got fewer than requested, that's fine — use what we have
+    if logger:
+        logger.info(
+            f"Init ROA anchors: {bdry_pts.shape[0]} boundary + "
+            f"{beyond_pts.shape[0]} beyond-boundary = {anchors.shape[0]} total "
+            f"(requested {num_anchors}, expand_factor={expand_factor})"
+        )
+    return anchors
+
+
+@torch.no_grad()
+def roa_bounding_box(
+    lyapunov_nn,
+    rho: float,
+    lower_limit: torch.Tensor,
+    upper_limit: torch.Tensor,
+    nx: int,
+    margin: float = 1.2,
+    num_samples: int = 500_000,
+) -> torch.Tensor:
+    """
+    Compute an axis-aligned bounding box of {x : V(x) ≤ ρ} by sampling.
+
+    Returns half-widths per dimension (positive), already multiplied by *margin*.
+    The resulting box is ±half_widths.  Clamped to [lower_limit, upper_limit].
+    """
+    device = lower_limit.device
+    x = (torch.rand(num_samples, nx, device=device)
+         * (upper_limit - lower_limit) + lower_limit)
+    V = lyapunov_nn(x).squeeze(-1)
+    inside = x[V <= rho]                       # (M, nx)
+    if inside.shape[0] == 0:
+        # No points found — fall back to tiny box
+        return torch.full((nx,), 0.01, device=device)
+    half = inside.abs().max(dim=0).values      # per-axis max absolute coord
+    half = half * margin                       # add margin
+    # Clamp to hard limits
+    hard_half = torch.max(upper_limit.abs(), lower_limit.abs())
+    half = torch.min(half, hard_half)
+    return half
 
 
 def linearize_pendulum(pendulum_continuous: pendulum.PendulumDynamics):
@@ -404,7 +583,11 @@ def pgd_find_verified_rho(
                 direction="minimize",
             ).detach()
             adv_out = torch.clamp(-ver_loss(adv_x), min=0.0)
-            if adv_out.max().item() > 1e-4:
+            # Threshold scales with max_rho so normalised P (small V values)
+            # doesn't hide violations behind a fixed 1e-4 cutoff.
+            violation_tol = 0
+            # max(1e-9, max_rho * 1e-3)
+            if adv_out.max().item() > violation_tol:
                 return False
         return True
 
@@ -521,6 +704,85 @@ def simulate_closed_loop(
     return torch.stack(traj, dim=0)   # (T+1, N, nx)
 
 
+def compute_projected_levelset(
+    lyapunov_nn: nn.Module,
+    rho: float,
+    dim_i: int,
+    dim_j: int,
+    lower_limit: torch.Tensor,
+    upper_limit: torch.Tensor,
+    grid_size: int = 80,
+    n_opt_steps: int = 200,
+    lr: float = 0.05,
+) -> tuple:
+    """Exact projection of {V(x) ≤ ρ} onto the (dim_i, dim_j) plane.
+
+    For each 2D grid point (xi, xj), minimises V over the remaining
+    state dimensions via batched Adam.  The minimum V value at each grid
+    point is returned; drawing the contour at level ρ gives the exact
+    geometric projection boundary.
+
+    Returns:
+        xi_vals:   1-D array of dim_i grid values.
+        xj_vals:   1-D array of dim_j grid values.
+        V_proj:    (grid_size, grid_size) array of min_V values.
+    """
+    device = lower_limit.device
+    nx = lower_limit.shape[0]
+    lo_np = lower_limit.cpu().numpy()
+    hi_np = upper_limit.cpu().numpy()
+
+    xi_vals = np.linspace(lo_np[dim_i], hi_np[dim_i], grid_size)
+    xj_vals = np.linspace(lo_np[dim_j], hi_np[dim_j], grid_size)
+    XI, XJ = np.meshgrid(xi_vals, xj_vals)          # each (G, G)
+    G = grid_size
+    N = G * G
+
+    other_dims = [d for d in range(nx) if d not in (dim_i, dim_j)]
+    n_other = len(other_dims)
+
+    # Fixed block: fill in the (i,j) coordinates
+    x_fixed = torch.zeros(N, nx, device=device)
+    x_fixed[:, dim_i] = torch.tensor(XI.flatten(), dtype=torch.float32, device=device)
+    x_fixed[:, dim_j] = torch.tensor(XJ.flatten(), dtype=torch.float32, device=device)
+
+    if n_other == 0:
+        with torch.no_grad():
+            V_proj = lyapunov_nn(x_fixed).squeeze(-1).cpu().numpy().reshape(G, G)
+        return xi_vals, xj_vals, V_proj
+
+    lo_other = lower_limit[other_dims]               # (n_other,)
+    hi_other = upper_limit[other_dims]               # (n_other,)
+
+    # Optimisable block: initialise at equilibrium (zero)
+    x_other = nn.Parameter(torch.zeros(N, n_other, device=device))
+    opt = torch.optim.Adam([x_other], lr=lr)
+
+    lyapunov_nn.eval()
+    for _ in range(n_opt_steps):
+        opt.zero_grad()
+        x_oth_clamped = torch.clamp(x_other,
+                                    lo_other.unsqueeze(0),
+                                    hi_other.unsqueeze(0))
+        x_full = x_fixed.detach().clone()
+        for k, d in enumerate(other_dims):
+            x_full[:, d] = x_oth_clamped[:, k]
+        loss = lyapunov_nn(x_full).squeeze(-1).sum()
+        loss.backward()
+        opt.step()
+
+    with torch.no_grad():
+        x_oth_clamped = torch.clamp(x_other,
+                                    lo_other.unsqueeze(0),
+                                    hi_other.unsqueeze(0))
+        x_full = x_fixed.clone()
+        for k, d in enumerate(other_dims):
+            x_full[:, d] = x_oth_clamped[:, k]
+        V_proj = lyapunov_nn(x_full).squeeze(-1).cpu().numpy().reshape(G, G)
+
+    return xi_vals, xj_vals, V_proj
+
+
 def plot_ellipsoid_projections(
     P_init: np.ndarray,
     rho_init: float,
@@ -530,28 +792,40 @@ def plot_ellipsoid_projections(
     state_labels: list,
     trajectories: torch.Tensor = None,
     title: str = "ROA Ellipsoid Projections",
+    lyapunov_final: nn.Module = None,
+    lower_limit_tensor: torch.Tensor = None,
+    upper_limit_tensor: torch.Tensor = None,
+    n_levelset_samples: int = 400_000,  # kept for API compat, unused
+    proj_grid_size: int = 80,
+    proj_opt_steps: int = 200,
 ) -> plt.Figure:
     """Plot all C(nx,2) projected ROA ellipses on a grid of 2-D panels.
 
-    Each panel shows the *true geometric projection* of the ellipsoid
-    {x : x^T P x ≤ ρ} onto a 2-D coordinate plane — not a slice.
-
-    The projection is computed via `project_ellipsoid`, which implements the
-    MATLAB formula using an SVD-based change of coordinates.
+    For each panel the *quadratic* ellipsoid {x : x^T P x ≤ ρ} is drawn via
+    `project_ellipsoid`. When ``lyapunov_final`` is provided, the exact
+    nonlinear ROA projection boundary is overlaid: for each 2D grid point the
+    remaining dims are optimized away (batched Adam), giving the true
+    projection {(xi,xj) : min_{others} V(x) ≤ ρ}.
 
     Args:
-        P_init:       nx×nx Lyapunov matrix for initial model.
-        rho_init:     Verified ρ for initial model.
-        P_final:      nx×nx Lyapunov matrix for trained model.
-        rho_final:    Verified ρ for trained model.
-        nx:           State dimension.
-        state_labels: List of nx axis labels, e.g. ['θ', 'θ̇', 'x_k1', 'x_k2'].
-        trajectories: Optional (T, N, nx) tensor of closed-loop trajectories.
-        title:        Figure suptitle.
+        P_init:              nx×nx Lyapunov matrix for initial model.
+        rho_init:            Verified ρ for initial model.
+        P_final:             nx×nx Lyapunov matrix for trained model.
+        rho_final:           Verified ρ for trained model.
+        nx:                  State dimension.
+        state_labels:        List of nx axis labels.
+        trajectories:        Optional (T, N, nx) tensor of trajectories.
+        title:               Figure suptitle.
+        lyapunov_final:      Trained NeuralNetworkLyapunov for nonlinear overlay.
+        lower_limit_tensor:  Lower box bound as torch.Tensor (nx,).
+        upper_limit_tensor:  Upper box bound as torch.Tensor (nx,).
+        proj_grid_size:      Grid resolution for exact projection.
+        proj_opt_steps:      Adam steps per grid point optimisation.
     Returns:
         matplotlib Figure.
     """
     import itertools
+
     pairs = list(itertools.combinations(range(nx), 2))
     n_pairs = len(pairs)
     ncols = min(3, n_pairs)
@@ -561,6 +835,19 @@ def plot_ellipsoid_projections(
 
     traj_np = (trajectories.cpu().numpy() if isinstance(trajectories, torch.Tensor)
               else trajectories) if trajectories is not None else None  # (T, N, nx)
+
+    # --- Pre-compute exact projected levelsets for the nonlinear V(x)=ρ ---
+    # Each entry: (xi_vals, xj_vals, V_proj) for the corresponding pair.
+    proj_grids = {}
+    if (lyapunov_final is not None and rho_final > 0
+            and lower_limit_tensor is not None and upper_limit_tensor is not None):
+        for (pi, pj) in pairs:
+            proj_grids[(pi, pj)] = compute_projected_levelset(
+                lyapunov_final, rho_final, pi, pj,
+                lower_limit_tensor, upper_limit_tensor,
+                grid_size=proj_grid_size,
+                n_opt_steps=proj_opt_steps,
+            )
 
     for idx, (i, j) in enumerate(pairs):
         ax = axes_flat[idx]
@@ -586,23 +873,40 @@ def plot_ellipsoid_projections(
                 Phat_init = project_ellipsoid(P_init, A)
                 ex, ey = ellipse_from_Phat(Phat_init, rho_init)
                 ax.plot(ex, ey, color='cyan', linewidth=2, linestyle='--',
-                        label=f'Initial ROA (ρ={rho_init:.4f})', zorder=5)
+                        label=f'Quadratic base (ρ₀={rho_init:.4f})', zorder=5)
                 ax.fill(ex, ey, alpha=0.08, color='cyan')
             except Exception as e:
                 if idx == 0:
                     print(f"[warn] project_ellipsoid(init) failed: {e}")
 
-        # ── Final ROA projection ─────────────────────────────────────────
+        # ── Final ROA projection (quadratic ellipse) ────────────────────
         if rho_final > 0 and P_final is not None:
             try:
                 Phat_final = project_ellipsoid(P_final, A)
                 ex, ey = ellipse_from_Phat(Phat_final, rho_final)
                 ax.plot(ex, ey, color='red', linewidth=2, linestyle='-',
-                        label=f'Trained ROA (ρ={rho_final:.4f})', zorder=6)
-                ax.fill(ex, ey, alpha=0.08, color='red')
+                        label=f'Quadratic approx (ρ={rho_final:.4f})', zorder=6)
+                ax.fill(ex, ey, alpha=0.06, color='red')
             except Exception as e:
                 if idx == 0:
                     print(f"[warn] project_ellipsoid(final) failed: {e}")
+
+        # ── Nonlinear V(x)=ρ exact projection (batched Adam minimisation) ─
+        if (i, j) in proj_grids:
+            xi_vals, xj_vals, V_proj = proj_grids[(i, j)]
+            try:
+                cs = ax.contour(xi_vals, xj_vals, V_proj, levels=[rho_final],
+                                colors=['orange'], linewidths=[2.5], zorder=8)
+                # Filled region
+                ax.contourf(xi_vals, xj_vals, V_proj, levels=[-np.inf, rho_final],
+                            colors=['orange'], alpha=0.12, zorder=7)
+                # Proxy for legend
+                if idx == 0:
+                    ax.plot([], [], color='orange', linewidth=2.5,
+                            label='V(x)=ρ exact projection')
+            except Exception as e:
+                if idx == 0:
+                    print(f"[warn] projection contour failed: {e}")
 
         ax.axhline(0, color='white', linewidth=0.4, alpha=0.4)
         ax.axvline(0, color='white', linewidth=0.4, alpha=0.4)
@@ -878,6 +1182,59 @@ def log_parameter_tables(
                 key = lbl.split("[")[0].strip().replace(" ", "_")
                 if t: tables[f"controller/{key}"] = t
 
+        elif controller_type == "rinn":
+            dt    = controller.dt
+            A_kd  = _np(controller.A_kd)
+            Bw_kd = _np(controller.Bw_kd)
+            By_kd = _np(controller.By_kd)
+            Cv    = _np(controller.Cv)
+            Dvw   = _np(controller.Dvw)
+            Dvy   = _np(controller.Dvy)
+            Cu    = _np(controller.Cu)
+            Duw   = _np(controller.Duw)
+            Duy   = _np(controller.Duy)
+            n_k   = A_kd.shape[0]
+            n_w   = Dvw.shape[0]
+            # Recover continuous-time matrices
+            A_ct  = (A_kd - np.eye(n_k)) / dt
+            Bw_ct = Bw_kd / dt
+            By_ct = By_kd / dt
+            trainable = isinstance(
+                getattr(controller, "A_kd", None), torch.nn.Parameter
+            )
+            phi_name = controller.phi.__class__.__name__
+            logger.info(
+                f"  Type: RINN Controller  "
+                f"(n_k={n_k}, n_w={n_w}, dt={dt}, φ={phi_name}, "
+                f"{'trainable' if trainable else 'frozen'})"
+            )
+            logger.info(
+                "  State:   ẋ_k = A x_k + Bw w + By y"
+            )
+            logger.info(
+                "  Implicit: v = Cv x_k + Dvw w + Dvy y,  w = φ(v)"
+            )
+            logger.info(
+                "  Output:  u = Cu x_k + Duw w + Duy y"
+            )
+            for lbl, mat in [
+                ("A   [continuous-time state matrix]", A_ct),
+                ("Bw  [continuous-time implicit-layer input]", Bw_ct),
+                ("By  [continuous-time plant-output input]", By_ct),
+                ("Cv  [implicit-layer state coupling]", Cv),
+                ("Dvw [implicit-layer feed-through, strictly upper tri]", Dvw),
+                ("Dvy [implicit-layer plant-output coupling]", Dvy),
+                ("Cu  [output state matrix]", Cu),
+                ("Duw [output implicit-layer coupling]", Duw),
+                ("Duy [output feed-through]", Duy),
+                ("Ā   [discrete state matrix  = I + dt·A]", A_kd),
+                ("B̄w  [discrete implicit input = dt·Bw]", Bw_kd),
+                ("B̄y  [discrete plant input    = dt·By]", By_kd),
+            ]:
+                t = _make_table(lbl, mat)
+                key = lbl.split("[")[0].strip().replace(" ", "_")
+                if t: tables[f"controller/{key}"] = t
+
         else:
             K_frozen    = _np(getattr(controller, "K_frozen",    None))
             K_trainable = _np(getattr(controller, "K_trainable", None))
@@ -1110,6 +1467,44 @@ def main(cfg: DictConfig):
             f"LTIC controller: n_k={n_k}, trainable={ltic_trainable}, "
             f"augmented state dim={dynamics.nx}"
         )
+    elif controller_type == 'rinn':
+        # ---- Recurrent Implicit Neural Network Controller ----
+        rinn_cfg = con_cfg.get('rinn', {})
+        A_r   = torch.tensor(rinn_cfg['A'],   dtype=dtype, device=device)
+        Bw_r  = torch.tensor(rinn_cfg['Bw'],  dtype=dtype, device=device)
+        By_r  = torch.tensor(rinn_cfg['By'],  dtype=dtype, device=device)
+        Cv_r  = torch.tensor(rinn_cfg['Cv'],  dtype=dtype, device=device)
+        Dvw_r = torch.tensor(rinn_cfg['Dvw'], dtype=dtype, device=device)
+        Dvy_r = torch.tensor(rinn_cfg['Dvy'], dtype=dtype, device=device)
+        Cu_r  = torch.tensor(rinn_cfg['Cu'],  dtype=dtype, device=device)
+        Duw_r = torch.tensor(rinn_cfg['Duw'], dtype=dtype, device=device)
+        Duy_r = torch.tensor(rinn_cfg['Duy'], dtype=dtype, device=device)
+        n_k = A_r.shape[0]
+        rinn_trainable = rinn_cfg.get('trainable', False)
+        rinn_activation = rinn_cfg.get('activation', 'relu')
+        rinn_freeze_dvw_lower = rinn_cfg.get('freeze_dvw_lower_tri', False)
+
+        controller = controllers.RINNController(
+            A=A_r, Bw=Bw_r, By=By_r,
+            Cv=Cv_r, Dvw=Dvw_r, Dvy=Dvy_r,
+            Cu=Cu_r, Duw=Duw_r, Duy=Duy_r,
+            n_plant=n_plant,
+            dt=dt,
+            output_fn=None,  # full-state: y = x_p
+            trainable=rinn_trainable,
+            freeze_dvw_lower_tri=rinn_freeze_dvw_lower,
+            activation=rinn_activation,
+            clip_output='clamp' if cfg.model.u_max else None,
+            u_lo=torch.tensor([-cfg.model.u_max], dtype=dtype, device=device) if cfg.model.u_max else None,
+            u_up=torch.tensor([cfg.model.u_max], dtype=dtype, device=device) if cfg.model.u_max else None,
+        )
+        # Wrap dynamics with augmented state [x_p, x_k]
+        dynamics = dynamical_system.AugmentedRINNDynamics(dynamics, controller)
+        logger.info(
+            f"RINN controller: n_k={n_k}, n_w={controller.n_w}, "
+            f"activation={rinn_activation}, trainable={rinn_trainable}, "
+            f"augmented state dim={dynamics.nx}"
+        )
     else:
         # ---- Default: Linear + NN Controller ----
         controller = controllers.LinearPlusNeuralNetworkController(
@@ -1129,19 +1524,33 @@ def main(cfg: DictConfig):
         )
     controller.to(device)
     controller.eval()
+    if controller_type == 'ltic':
+        _con_trainable = ltic_cfg.get('trainable', False)
+    elif controller_type == 'rinn':
+        _con_trainable = rinn_cfg.get('trainable', False)
+    else:
+        _con_trainable = use_trainable_con
     logger.info(f"Controller type={controller_type}, "
-                f"Frozen={use_frozen_con if controller_type != 'ltic' else 'N/A'}, "
-                f"Trainable={use_trainable_con if controller_type != 'ltic' else ltic_cfg.get('trainable', False)}, "
-                f"NN={use_nonlinear_con if controller_type != 'ltic' else False}")
+                f"Frozen={use_frozen_con if controller_type not in ('ltic', 'rinn') else 'N/A'}, "
+                f"Trainable={_con_trainable}, "
+                f"NN={use_nonlinear_con if controller_type not in ('ltic', 'rinn') else False}")
 
     # Resolve Lyapunov components
-    nx = dynamics.nx  # augmented state dim (n_p + n_k for LTIC, n_p otherwise)
+    nx = dynamics.nx  # augmented state dim (n_p + n_k for LTIC/RINN, n_p otherwise)
 
-    # Build augmented limit vector (includes controller state limits for LTIC).
+    # Build augmented limit vector (includes controller state limits for LTIC/RINN).
     plant_limit = torch.tensor(cfg.model.limit, dtype=dtype, device=device)
     if controller_type == 'ltic':
         controller_limit = torch.tensor(
             ltic_cfg.get('controller_limit', [1.0] * n_k),
+            dtype=dtype, device=device,
+        )
+        model_limit = torch.cat([plant_limit, controller_limit])
+        logger.info(f"Augmented limit: plant={plant_limit.tolist()}, "
+                     f"controller={controller_limit.tolist()}")
+    elif controller_type == 'rinn':
+        controller_limit = torch.tensor(
+            rinn_cfg.get('controller_limit', [1.0] * n_k),
             dtype=dtype, device=device,
         )
         model_limit = torch.cat([plant_limit, controller_limit])
@@ -1153,6 +1562,7 @@ def main(cfg: DictConfig):
     R_frozen = None
     R_trainable = None
     P_val = None
+    p_norm = None
     lya_eps_from_P = 0.0
 
     if use_frozen_lya or use_trainable_lya:
@@ -1175,7 +1585,7 @@ def main(cfg: DictConfig):
             # regardless of how the user provided P_init (rho adjusts accordingly).
             p_norm = P_val.norm()
             P_val = P_val / p_norm
-            logger.info(f"  P_val normalised (‖P‖_F = {p_norm:.4e} → 1.0)")
+            logger.info(f"  P_val normalised (\u2016P\u2016_F = {p_norm:.4e} \u2192 1.0)")
 
             # Factorise P_val so R^T R = P_val exactly.
             # torch.linalg.cholesky returns L with P = L @ L^T (lower triangular).
@@ -1207,9 +1617,31 @@ def main(cfg: DictConfig):
     lya_activation = ACTIVATION_MAP.get(lya_activation_name, nn.LeakyReLU)
     logger.info(f"Lyapunov NN activation: {lya_activation_name}")
 
-    # When R was initialised from P_init the eps*I term is redundant (R^T R is already PD).
-    # Fall back to 0.01 only when no P_init was supplied.
-    lya_eps = lya_eps_from_P if P_val is not None else 0.01
+    # Always keep a tiny positive eps floor so R_trainable cannot collapse to zero
+    # during optimisation
+    _eps_floor = 1e-6
+    lya_eps = max(float(lya_eps_from_P), _eps_floor) if P_val is not None else 0.01
+
+    # For any quadratic_times_* mode, honour the user's use_nonlinear flag.
+    # quadratic_times_<fn> + use_nonlinear=False → pure quadratic (no NN in graph).
+    # quadratic_times_<fn> + use_nonlinear=True  → V = x'Px · multiplier(NN(x)).
+    #   tanh: multiplier = 1 + α·tanh(NN),  α = nn_scale ∈ (0,1)
+    #   exp:  multiplier = exp(NN),           always > 0, no α constraint needed
+    v_psd_form = cfg.model.V_psd_form
+    nn_scale = lya_cfg.get('nn_scale', 0.5)
+    if v_psd_form.startswith("quadratic_times_"):
+        suffix = v_psd_form[len("quadratic_times_"):]
+        if use_nonlinear_lya:
+            lya_activation = nn.Tanh
+            logger.info(
+                f"quadratic_times_{suffix} mode: NN enabled (use_nonlinear=True), "
+                f"tanh activation, nn_scale={nn_scale}, zero-init last layer"
+            )
+        else:
+            logger.info(
+                f"quadratic_times_{suffix} mode: NN disabled (use_nonlinear=False) "
+                f"→ pure trainable quadratic"
+            )
 
     lyapunov_nn = lyapunov.NeuralNetworkLyapunov(
         goal_state=dynamics.x_equilibrium.to(dtype).to(device),
@@ -1220,8 +1652,9 @@ def main(cfg: DictConfig):
         absolute_output=absolute_output,
         eps=lya_eps,
         activation=lya_activation,
-        V_psd_form=cfg.model.V_psd_form,
+        V_psd_form=v_psd_form,
         use_nonlinear=use_nonlinear_lya,
+        nn_scale=nn_scale,
     )
     lyapunov_nn.to(device)
     lyapunov_nn.eval()
@@ -1245,10 +1678,15 @@ def main(cfg: DictConfig):
     # Note: This initial derivative_lyaloss is just a placeholder and will be recreated in the training loop
     # Handle ListConfig from OmegaConf
     rho_mult_init = rho_multiplier[0] if hasattr(rho_multiplier, '__getitem__') and not isinstance(rho_multiplier, (int, float)) else rho_multiplier
-    # Get supply rate scaling (alpha) from config
+    # Supply-rate scaling: V is built from P/\u2016P\u2016_F, so the dissipation
+    # inequality must be scaled by 1/\u2016P\u2016_F to stay dimensionally consistent.
+    # When s_scale is left at its default (1.0) and P was normalised, auto-set it.
     s_scale = cfg.loss.get('s_scale', 1.0)
-    if s_scale != 1.0:
-        logger.info(f"Using supply rate scaling alpha = {s_scale}")
+    if s_scale == 1.0 and p_norm is not None and p_norm != 1.0:
+        s_scale = 1.0 / float(p_norm)
+        logger.info(f"Auto s_scale = 1/\u2016P\u2016_F = {s_scale:.6e}  (P was normalised)")
+    elif s_scale != 1.0:
+        logger.info(f"Using supply rate scaling s_scale = {s_scale}")
 
     derivative_lyaloss = lyapunov.DissipativityDerivativeLoss(
         dynamics,
@@ -1304,6 +1742,20 @@ def main(cfg: DictConfig):
     save_lyaloss = cfg.model.save_lyaloss
     V_decrease_within_roa = cfg.model.V_decrease_within_roa
 
+    # ── State labels (needed by both pre-training and post-training plots) ─
+    if controller_type == 'ltic':
+        _nk_sl = ltic_cfg.get('n_k', 0)
+        _plant_labels = [r"$\theta$ (rad)", r"$\dot{\theta}$ (rad/s)"]
+        _ctrl_labels  = [rf"$x_{{k{i+1}}}$" for i in range(_nk_sl)]
+        state_labels  = (_plant_labels + _ctrl_labels)[:nx]
+    elif controller_type == 'rinn':
+        _nk_sl = cfg.model.controller.rinn.get('n_k', 0)
+        _plant_labels = [r"$\theta$ (rad)", r"$\dot{\theta}$ (rad/s)"]
+        _ctrl_labels  = [rf"$x_{{k{i+1}}}$" for i in range(_nk_sl)]
+        state_labels  = (_plant_labels + _ctrl_labels)[:nx]
+    else:
+        state_labels = [r"$\theta$ (rad)", r"$\dot{\theta}$ (rad/s)"][:nx]
+
     # =====================================================================
     # Pre-training verification: find largest verified rho with initial model
     # =====================================================================
@@ -1340,6 +1792,22 @@ def main(cfg: DictConfig):
         init_lyapunov_state = {
             k: v.clone() for k, v in lyapunov_nn.state_dict().items()
         }
+
+        # Diagnose user-specified adversarial examples (pre-training)
+        adv_examples = cfg.get('test_adversarial_examples', None)
+        if adv_examples and init_rho > 0:
+            diagnose_adversarial_examples(
+                examples=adv_examples,
+                lyapunov_nn=lyapunov_nn,
+                dynamics=dynamics,
+                controller=controller,
+                supply_rate_fn=supply_rate,
+                s_scale=s_scale,
+                rho=init_rho,
+                nx=nx,
+                logger=logger,
+                label="PRE-TRAINING",
+            )
 
         # Plot initial ROA (2D slice for >2D)
         if init_rho > 0:
@@ -1382,6 +1850,30 @@ def main(cfg: DictConfig):
             plt.close(fig_init)
             logger.info(f"Initial ROA plot saved: {init_plot_path}")
 
+            # Ellipsoid projections for initial model
+            with torch.no_grad():
+                P_init_eff_pre = lyapunov_nn.eps * torch.eye(nx, device=device)
+                if hasattr(lyapunov_nn, 'R_frozen') and lyapunov_nn.R_frozen is not None:
+                    P_init_eff_pre = P_init_eff_pre + lyapunov_nn.R_frozen.T @ lyapunov_nn.R_frozen
+                if hasattr(lyapunov_nn, 'R_trainable') and lyapunov_nn.R_trainable is not None:
+                    P_init_eff_pre = P_init_eff_pre + lyapunov_nn.R_trainable.T @ lyapunov_nn.R_trainable
+            fig_proj_pre = plot_ellipsoid_projections(
+                P_init=P_init_eff_pre.cpu().numpy(),
+                rho_init=init_rho,
+                P_final=None,
+                rho_final=0.0,
+                nx=nx,
+                state_labels=state_labels,
+                trajectories=None,
+                title=f"Initial ROA Projections  (ρ₀={init_rho:.5f})",
+            )
+            proj_pre_path = os.path.join(os.getcwd(), "V_init_roa_proj.png")
+            fig_proj_pre.savefig(proj_pre_path, dpi=150)
+            plt.close(fig_proj_pre)
+            logger.info(f"Initial ROA projections saved: {proj_pre_path}")
+            if cfg.train.wandb.enabled:
+                wandb.log({"V_init_roa_proj": wandb.Image(proj_pre_path)})
+
         else:
             logger.warning("Initial verified rho is 0; skipping initial ROA plot.")
 
@@ -1410,21 +1902,53 @@ def main(cfg: DictConfig):
 
             # When domain_expansion is active, optionally override the initial
             # training box to a small fraction of the hard limits, then grow it.
-            # This mirrors Two-Stage: limit_scale=1 gives the hard limit;
-            # domain_init_scale controls where verification starts.
+            # domain_init_scale controls where verification starts:
+            #   - numeric (e.g. 0.15): use that fraction of model_limit
+            #   - "auto": derive from the initial verified ROA bounding box
             domain_expansion_flag = cfg.train.get('domain_expansion', False)
             domain_init_scale = cfg.model.get('domain_init_scale', None)
+            domain_init_margin = cfg.model.get('domain_init_margin', 1.2)
+
             if domain_expansion_flag and domain_init_scale is not None:
-                init_limit = domain_init_scale * model_limit
-                lower_limit = -init_limit
-                upper_limit = init_limit
-                derivative_lyaloss.box_lo = lower_limit
-                derivative_lyaloss.box_up = upper_limit
-                logger.info(
-                    f"Stage {n}: domain_init_scale={domain_init_scale}, "
-                    f"starting box ±{init_limit.tolist()}, "
-                    f"hard limits ±{model_limit.tolist()}"
-                )
+                if str(domain_init_scale).lower() == 'auto':
+                    # --- Auto-domain from verified ROA ---
+                    if init_rho > 0 and init_lyapunov_state is not None:
+                        # Use initial V₀ to compute bounding box of {x: V₀(x) ≤ ρ₀}
+                        current_state = {k: v.clone() for k, v in lyapunov_nn.state_dict().items()}
+                        lyapunov_nn.load_state_dict(init_lyapunov_state)
+                        init_half = roa_bounding_box(
+                            lyapunov_nn, init_rho,
+                            -model_limit, model_limit, nx,
+                            margin=domain_init_margin,
+                        )
+                        lyapunov_nn.load_state_dict(current_state)
+                        lower_limit = -init_half
+                        upper_limit = init_half
+                        derivative_lyaloss.box_lo = lower_limit
+                        derivative_lyaloss.box_up = upper_limit
+                        logger.info(
+                            f"Stage {n}: domain_init_scale=auto (from init ROA), "
+                            f"margin={domain_init_margin}, "
+                            f"starting box ±{init_half.tolist()}, "
+                            f"hard limits ±{model_limit.tolist()}"
+                        )
+                    else:
+                        logger.warning(
+                            "domain_init_scale='auto' but init_rho=0 or verify_init disabled; "
+                            "using full model_limit as fallback."
+                        )
+                else:
+                    # --- Fixed scale ---
+                    init_limit = float(domain_init_scale) * model_limit
+                    lower_limit = -init_limit
+                    upper_limit = init_limit
+                    derivative_lyaloss.box_lo = lower_limit
+                    derivative_lyaloss.box_up = upper_limit
+                    logger.info(
+                        f"Stage {n}: domain_init_scale={domain_init_scale}, "
+                        f"starting box ±{init_limit.tolist()}, "
+                        f"hard limits ±{model_limit.tolist()}"
+                    )
 
             if save_lyaloss:
                 save_lyaloss_path = os.path.join(
@@ -1438,12 +1962,46 @@ def main(cfg: DictConfig):
                 device=device,
                 dtype=torch.float32,
             )
-            # Pad with zeros for controller states in LTIC mode
-            if controller_type == 'ltic' and candidate_roa_states.shape[-1] < nx:
+            # Pad with zeros for controller states in LTIC/RINN mode
+            if controller_type in ('ltic', 'rinn') and candidate_roa_states.shape[-1] < nx:
                 pad_width = nx - candidate_roa_states.shape[-1]
                 pad = torch.zeros(*candidate_roa_states.shape[:-1], pad_width,
                                   device=device, dtype=torch.float32)
                 candidate_roa_states = torch.cat([candidate_roa_states, pad], dim=-1)
+
+            # ── Auto-populate anchors from initial verified ROA ───────────
+            use_anchors = cfg.get('use_init_roa_anchors', False)
+            anchor_weight = cfg.get('init_roa_anchor_weight', 0.1)
+            anchor_expand = cfg.get('init_roa_anchor_expand', 1.5)
+            anchor_count  = cfg.get('init_roa_num_anchors', 256)
+            cand_weight = get_val(cfg.loss.candidate_roa_states_weight, n)
+            always_cand = cfg.loss.always_candidate_roa_regulizer
+
+            if use_anchors and init_rho > 0 and init_lyapunov_state is not None:
+                # Temporarily reload initial V to sample from its landscape
+                current_state = {k: v.clone() for k, v in lyapunov_nn.state_dict().items()}
+                lyapunov_nn.load_state_dict(init_lyapunov_state)
+
+                anchors = sample_init_roa_anchors(
+                    lyapunov_nn, init_rho,
+                    -model_limit, model_limit, nx,
+                    num_anchors=anchor_count,
+                    expand_factor=anchor_expand,
+                    logger=logger,
+                )
+
+                # Restore current V
+                lyapunov_nn.load_state_dict(current_state)
+
+                if anchors.shape[0] > 0:
+                    candidate_roa_states = torch.cat([candidate_roa_states, anchors], dim=0)
+                    cand_weight = max(cand_weight, anchor_weight)
+                    always_cand = True
+                    logger.info(
+                        f"Init ROA anchors active: "
+                        f"candidate_roa_states={candidate_roa_states.shape[0]}, "
+                        f"weight={cand_weight}, always_on=True"
+                    )
 
             _train_ret = train_utils.train_lyapunov_with_buffer(
                 derivative_lyaloss=derivative_lyaloss,
@@ -1470,12 +2028,12 @@ def main(cfg: DictConfig):
                 num_samples_per_boundary=cfg.train.num_samples_per_boundary,
                 Vmin_x_pgd_buffer_size=cfg.train.get('Vmin_x_pgd_buffer_size', 500000),
                 V_decrease_within_roa=V_decrease_within_roa,
-                Vmin_x_boundary_weight=cfg.loss.Vmin_x_boundary_weight,
-                Vmax_x_boundary_weight=cfg.loss.Vmax_x_boundary_weight,
+                Vmin_x_boundary_weight=cfg.loss.get('Vmin_x_boundary_weight', 0.0),
+                Vmax_x_boundary_weight=cfg.loss.get('Vmax_x_boundary_weight', 0.0),
                 candidate_roa_states=candidate_roa_states,
-                candidate_roa_states_weight=get_val(cfg.loss.candidate_roa_states_weight, n),
+                candidate_roa_states_weight=cand_weight,
                 logger=logger,
-                always_candidate_roa_regulizer=cfg.loss.always_candidate_roa_regulizer,
+                always_candidate_roa_regulizer=always_cand,
                 # Zubov sampling
                 zubov_sampling=cfg.train.get('zubov_sampling', False),
                 zubov_num_bands=cfg.train.get('zubov_num_bands', 5),
@@ -1663,15 +2221,7 @@ def main(cfg: DictConfig):
     # =====================================================================
     # Visualisation: heatmap + ellipsoid projections
     # =====================================================================
-
-    # ── State labels ──────────────────────────────────────────────────────
-    if controller_type == 'ltic':
-        n_k = ltic_cfg.get('n_k', 0)
-        _plant_labels = [r"$\theta$ (rad)", r"$\dot{\theta}$ (rad/s)"]
-        _ctrl_labels  = [rf"$x_{{k{i+1}}}$" for i in range(n_k)]
-        state_labels  = (_plant_labels + _ctrl_labels)[:nx]
-    else:
-        state_labels = [r"$\theta$ (rad)", r"$\dot{\theta}$ (rad/s)"][:nx]
+    # (state_labels already built above, before pre-training block)
 
     # ── Simulate closed-loop trajectories ────────────────────────────────
     n_vis_traj = 24
@@ -1760,6 +2310,22 @@ def main(cfg: DictConfig):
             improvement = 0.0
             logger.info("Improvement:           none (both rho = 0)")
 
+        # Diagnose user-specified adversarial examples (post-training)
+        adv_examples = cfg.get('test_adversarial_examples', None)
+        if adv_examples and final_verified_rho > 0:
+            diagnose_adversarial_examples(
+                examples=adv_examples,
+                lyapunov_nn=lyapunov_nn,
+                dynamics=dynamics,
+                controller=controller,
+                supply_rate_fn=supply_rate,
+                s_scale=s_scale,
+                rho=final_verified_rho,
+                nx=nx,
+                logger=logger,
+                label="POST-TRAINING",
+            )
+
         # ── Old-style V heatmap comparison (x1-x2 slice) ─────────────────
         fig_cmp = plot_roa_comparison(
             V_init_fn=lyapunov_init,
@@ -1793,7 +2359,7 @@ def main(cfg: DictConfig):
             plt.close(fig_proj_init)
             logger.info(f"Initial ROA projections saved: {proj_path_init}")
 
-        # ── Ellipsoid projection: trained model only ──────────────────────
+        # ── Ellipsoid projection: trained model only (+ nonlinear overlay) ─
         if final_verified_rho > 0:
             fig_proj_final = plot_ellipsoid_projections(
                 P_init   = None,
@@ -1804,13 +2370,16 @@ def main(cfg: DictConfig):
                 state_labels = state_labels,
                 trajectories = traj_tensor,
                 title    = f"Trained ROA Projections  (ρ={final_verified_rho:.5f})",
+                lyapunov_final      = lyapunov_nn,
+                lower_limit_tensor  = lower_limit,
+                upper_limit_tensor  = upper_limit,
             )
             proj_path_final = os.path.join(os.getcwd(), "roa_proj_final.png")
             fig_proj_final.savefig(proj_path_final, dpi=150)
             plt.close(fig_proj_final)
             logger.info(f"Trained ROA projections saved: {proj_path_final}")
 
-        # ── Ellipsoid projection: both overlaid ───────────────────────────
+        # ── Ellipsoid projection: both overlaid (+ nonlinear overlay) ────
         if init_rho > 0 or final_verified_rho > 0:
             fig_proj_cmp = plot_ellipsoid_projections(
                 P_init   = P_init_np   if init_rho > 0           else None,
@@ -1823,6 +2392,9 @@ def main(cfg: DictConfig):
                 title    = (f"ROA Projection Comparison  "
                             f"ρ₀={init_rho:.5f} → ρ={final_verified_rho:.5f}  "
                             f"({improvement:+.1f}%)"),
+                lyapunov_final      = lyapunov_nn if final_verified_rho > 0 else None,
+                lower_limit_tensor  = lower_limit,
+                upper_limit_tensor  = upper_limit,
             )
             proj_path_cmp = os.path.join(os.getcwd(), "roa_proj_comparison.png")
             fig_proj_cmp.savefig(proj_path_cmp, dpi=150)
@@ -1849,6 +2421,9 @@ def main(cfg: DictConfig):
                 nx=nx, state_labels=state_labels,
                 trajectories=traj_tensor,
                 title=f"Trained ROA Projections  (ρ={rho_plot:.5f})",
+                lyapunov_final     = lyapunov_nn,
+                lower_limit_tensor = lower_limit,
+                upper_limit_tensor = upper_limit,
             )
             proj_path_final = os.path.join(os.getcwd(), "roa_proj_final.png")
             fig_proj_final.savefig(proj_path_final, dpi=150)
