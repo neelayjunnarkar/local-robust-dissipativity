@@ -407,6 +407,199 @@ class LTIDynamicController(nn.Module):
         return x_k @ self.A_kd.T + y @ self.B_kd.T
 
 
+class RINNController(nn.Module):
+    """
+    Recurrent Implicit Neural Network (RINN) Dynamic Controller.
+
+    Continuous-time formulation::
+
+        ẋ_k = A x_k + Bw w + By y
+        v    = Cv x_k + Dvw w + Dvy y      (implicit layer equation)
+        w    = φ(v)                         (element-wise activation)
+        u    = Cu x_k + Duw w + Duy y
+
+    ``Dvw`` is **strictly upper triangular**, so the implicit equation
+    ``v = Cv x_k + Dvw φ(v) + Dvy y`` is solved exactly by a single
+    backward sweep (back-substitution from the last element to the first).
+
+    Stored internally in discrete-time (Euler discretisation)::
+
+        x_k[t+1] = x_k[t] + dt·(A x_k + Bw w + By y)
+
+    The controller operates on augmented state ξ = [x_p, x_k].
+
+    * ``forward(ξ)`` → u   (called by the loss's ``self.controller(x)``).
+    * ``evolve_state(x_k, y)`` → x_k_next  (called by augmented dynamics).
+    * ``solve_implicit(x_k, y)`` → w  (back-substitution solve).
+
+    When ``trainable=False`` matrices are stored as buffers (frozen).
+    When ``trainable=True`` matrices are ``nn.Parameter`` s (optimised).
+    """
+
+    def __init__(
+        self,
+        A: torch.Tensor,
+        Bw: torch.Tensor,
+        By: torch.Tensor,
+        Cv: torch.Tensor,
+        Dvw: torch.Tensor,
+        Dvy: torch.Tensor,
+        Cu: torch.Tensor,
+        Duw: torch.Tensor,
+        Duy: torch.Tensor,
+        n_plant: int,
+        dt: float,
+        output_fn: nn.Module = None,
+        trainable: bool = False,
+        freeze_dvw_lower_tri: bool = False,
+        activation: str = 'relu',
+        clip_output: str = None,
+        u_lo: torch.Tensor = None,
+        u_up: torch.Tensor = None,
+    ):
+        """
+        Args:
+            A:   (n_k, n_k) controller state matrix.
+            Bw:  (n_k, n_w) controller implicit-layer input matrix.
+            By:  (n_k, n_y) controller plant-output input matrix.
+            Cv:  (n_w, n_k) implicit-layer state-coupling matrix.
+            Dvw: (n_w, n_w) strictly upper triangular feed-through.
+            Dvy: (n_w, n_y) implicit-layer plant-output coupling.
+            Cu:  (n_u, n_k) output state matrix.
+            Duw: (n_u, n_w) output implicit-layer coupling.
+            Duy: (n_u, n_y) output feed-through.
+            n_plant: dimension of the plant state x_p.
+            dt: discretisation time step.
+            output_fn: nn.Module mapping x_p → y.  None means y = x_p.
+            trainable: if True all matrices become nn.Parameters.
+            freeze_dvw_lower_tri: if True (and trainable), register a gradient
+                hook that zeroes the lower-triangle grad of Dvw after each
+                backward pass so the optimizer never updates those entries.
+            activation: 'relu' or 'leaky_relu'.
+            clip_output: 'clamp' or None.
+            u_lo, u_up: control bounds.
+        """
+        super().__init__()
+        n_k = A.shape[0]
+        n_w = Dvw.shape[0]
+        self.n_k = n_k
+        self.n_w = n_w
+        self.n_plant = n_plant
+        self.dt = dt
+        self.output_fn = output_fn
+        self.clip_output = clip_output
+
+        # Activation (must be nn.Module for auto_LiRPA)
+        if activation == 'leaky_relu':
+            self.phi = nn.LeakyReLU(negative_slope=0.01)
+        else:
+            self.phi = nn.ReLU()
+
+        # Number of back-substitution sweeps = n_w (one per row)
+        self.n_sweeps = n_w
+
+        # Store matrices
+        def _store(name, tensor):
+            if trainable:
+                self.register_parameter(name, nn.Parameter(tensor.clone()))
+            else:
+                self.register_buffer(name, tensor.clone())
+
+        # State equation (continuous): ẋ_k = A x_k + Bw w + By y
+        # Discretised: x_k+ = (I + dt·A) x_k + dt·Bw w + dt·By y
+        A_kd = torch.eye(n_k, dtype=A.dtype) + dt * A
+        Bw_kd = dt * Bw
+        By_kd = dt * By
+
+        _store('A_kd', A_kd)
+        _store('Bw_kd', Bw_kd)
+        _store('By_kd', By_kd)
+
+        # Implicit-layer matrices (no discretisation needed)
+        _store('Cv', Cv)
+        _store('Dvw', Dvw)
+        _store('Dvy', Dvy)
+
+        # Optionally zero lower-triangle gradients of Dvw after every backward
+        if trainable and freeze_dvw_lower_tri:
+            mask = torch.triu(torch.ones(n_w, n_w, dtype=torch.bool), diagonal=1)
+            self.register_buffer('_dvw_upper_mask', mask)
+
+            def _zero_lower_tri_grad(grad: torch.Tensor) -> torch.Tensor:
+                return grad * self._dvw_upper_mask
+
+            self.Dvw.register_hook(_zero_lower_tri_grad)
+
+        # Output equation matrices (no discretisation needed)
+        _store('Cu', Cu)
+        _store('Duw', Duw)
+        _store('Duy', Duy)
+
+        if u_lo is not None:
+            self.register_buffer('u_lo', u_lo.clone())
+        else:
+            self.u_lo = None
+        if u_up is not None:
+            self.register_buffer('u_up', u_up.clone())
+        else:
+            self.u_up = None
+
+    # -- helpers -------------------------------------------------------
+
+    def _get_y(self, x_p: torch.Tensor) -> torch.Tensor:
+        """Plant output from plant state."""
+        if self.output_fn is not None:
+            return self.output_fn(x_p)
+        return x_p
+
+    def solve_implicit(self, x_k: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        Solve the implicit layer  v = Cv x_k + Dvw φ(v) + Dvy y  for w = φ(v).
+
+        Because Dvw is strictly upper triangular, a single backward sweep
+        (from row n_w-1 down to 0) gives the exact solution.
+
+        At row i, v[i] depends only on w[j] for j > i (already solved).
+
+        Uses a list of per-column tensors (no in-place ops) so autograd
+        can differentiate through the solve when matrices are trainable.
+        """
+        # Base terms that don't depend on w
+        base = x_k @ self.Cv.T + y @ self.Dvy.T  # (batch, n_w)
+
+        # Collect solved columns; avoid in-place writes for autograd safety
+        w_cols: list[torch.Tensor] = [None] * self.n_w  # type: ignore[assignment]
+
+        for i in range(self.n_w - 1, -1, -1):
+            # v[i] = base[i] + sum_{j > i} Dvw[i, j] * w[j]
+            v_i = base[:, i]  # (batch,)
+            for j in range(i + 1, self.n_w):
+                v_i = v_i + self.Dvw[i, j] * w_cols[j]
+            w_cols[i] = self.phi(v_i)  # (batch,)
+
+        return torch.stack(w_cols, dim=1)  # (batch, n_w)
+
+    # -- public API ----------------------------------------------------
+
+    def forward(self, xi: torch.Tensor) -> torch.Tensor:
+        """Compute control u from augmented state ξ = [x_p, x_k]."""
+        x_p = xi[:, :self.n_plant]
+        x_k = xi[:, self.n_plant:]
+        y = self._get_y(x_p)
+
+        w = self.solve_implicit(x_k, y)
+        u = x_k @ self.Cu.T + w @ self.Duw.T + y @ self.Duy.T
+
+        if self.clip_output == 'clamp' and self.u_lo is not None:
+            u = torch.max(torch.min(u, self.u_up), self.u_lo)
+        return u
+
+    def evolve_state(self, x_k: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Discrete-time controller state update with implicit-layer solve."""
+        w = self.solve_implicit(x_k, y)
+        return x_k @ self.A_kd.T + w @ self.Bw_kd.T + y @ self.By_kd.T
+
+
 class NeuralNetworkLuenbergerObserver(nn.Module):
     """
     Neural network observer that takes vectors as observations.

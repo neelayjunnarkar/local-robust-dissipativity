@@ -1,0 +1,178 @@
+wandb_name: pendulum_state_rinn_n8_train_exp
+defaults:
+  - user: pendulum_state_training_default
+  - train_template
+
+hydra:
+  run:
+    dir: ${user.run_dir}
+  sweep:
+    dir: ${user.run_dir}
+
+use_sdp_init: False
+approximate_lqr: False
+
+verify_init: True
+
+# Use initial verified ROA to anchor & push ROA growth during training.
+# Samples boundary + beyond-boundary points from V₀, uses them as
+# candidate_roa_states with always-on regularizer.
+use_init_roa_anchors: True
+init_roa_num_anchors: 128       # total anchor points (half boundary, half beyond)
+init_roa_anchor_expand: 1.25     # beyond-boundary band: V₀ ∈ [ρ₀, 1.5·ρ₀]
+init_roa_anchor_weight: 0.1     # min weight for candidate_roa_states_weight
+
+# Adversarial examples to diagnose before/after training.
+# Each entry is [x1, ..., xn, w1, ..., wm] (state + disturbance).
+# test_adversarial_examples:
+#   - [-2.05993474e-01, -3.96121442e-01, 5.37441811e-04, -6.01494871e-02, 4.61957861e-05]
+
+supply_rate:
+  type: l2gain
+  gamma: 100
+  w_max: 0.024525
+pgd_verifier_steps: 300
+pgd_verifier_num_seeds: 5
+pgd_verifier_stop_early: False
+
+model:
+  normalize_coordinates: False
+
+  # Full augmented 4×4 Lyapunov matrix P — [x_p (2), x_k (2)] blocks.
+  # Taken from the n_w=8 RINN trained run (already normalised; code re-normalises).
+  P_init: [[ 1.5211e-02,  1.1826e-03, -3.9104e-05,  7.0204e-05],
+           [ 1.1826e-03,  1.1001e-03,  1.4486e-04,  5.6436e-05],
+           [-3.9104e-05,  1.4486e-04,  1.3817e-02,  4.1302e-03],
+           [ 7.0204e-05,  5.6436e-05,  4.1302e-03,  3.8687e-03]]
+
+  K_init: null
+
+  # Performance output z = C_z * x_p  (full pendulum state, nz=2)
+  output_C: [[1.0, 0.0],
+             [0.0, 1.0]]
+
+  controller:
+    type: rinn
+
+    # ================================================================
+    # Recurrent Implicit Neural Network Controller (RINN).
+    # n_k=2 controller states, n_w=8 implicit-layer (hidden) units.
+    #
+    #   x_k+ = A x_k + Bw w + By y        y = x_p (full-state feedback)
+    #   v    = Cv x_k + Dvw w + Dvy y     (Dvw strictly upper-triangular)
+    #   w    = phi(v)                      (element-wise activation)
+    #   u    = Cu x_k + Duw w + Duy y
+    # ================================================================
+    rinn:
+      n_k: 2      # controller state dimension
+      n_w: 8      # implicit-layer (hidden) dimension
+      activation: relu
+
+      A:   [[-3.1509, -1.4492],
+            [-1.1005, -0.6330]]
+
+      Bw:  [[ 0.0236, -0.0235, -0.0235,  0.0245,  0.0232, -0.0232,  0.0236, -0.0231],
+            [ 0.0219, -0.0219, -0.0218,  0.0229,  0.0215, -0.0215,  0.0221, -0.0214]]
+
+      By:  [[-0.0151,  0.0151],
+            [-0.0204,  0.0978]]
+
+      Cv:  [[ 0.0188, -0.0085],
+            [-0.0185,  0.0083],
+            [-0.0188,  0.0085],
+            [ 0.0250, -0.0127],
+            [ 0.0210, -0.0100],
+            [-0.0193,  0.0090],
+            [ 0.0228, -0.0111],
+            [-0.0192,  0.0090]]
+
+      Dvw: [[ 0.0000, -0.0327, -0.0327,  0.0348,  0.0327, -0.0323,  0.0332, -0.0320],
+            [ 0.0000,  0.0000,  0.0327, -0.0348, -0.0327,  0.0323, -0.0332,  0.0320],
+            [ 0.0000,  0.0000,  0.0000, -0.0348, -0.0327,  0.0323, -0.0332,  0.0320],
+            [ 0.0000,  0.0000,  0.0000,  0.0000,  0.0313, -0.0304,  0.0322, -0.0302],
+            [ 0.0000,  0.0000,  0.0000,  0.0000,  0.0000, -0.0319,  0.0331, -0.0316],
+            [ 0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000, -0.0333,  0.0321],
+            [ 0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000, -0.0309],
+            [ 0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000]]
+
+      Dvy: [[-0.0063,  0.0235],
+            [ 0.0065, -0.0234],
+            [ 0.0063, -0.0235],
+            [-0.0072,  0.0275],
+            [-0.0059,  0.0248],
+            [ 0.0057, -0.0238],
+            [-0.0066,  0.0259],
+            [ 0.0056, -0.0238]]
+
+      Cu:  [[ 0.0906,  0.0395]]
+
+      Duw: [[ 0.0342, -0.0338, -0.0340,  0.0353,  0.0343, -0.0346,  0.0338, -0.0344]]
+
+      Duy: [[-2.7673, -2.1278]]
+
+      controller_limit: [1, 1]
+
+      trainable: True
+      freeze_dvw_lower_tri: True   # only upper-triangle entries of Dvw are trained
+
+  lyapunov:
+    use_frozen_quadratic: False
+    use_trainable_quadratic: True
+    use_nonlinear: True           # True = V = x'Px·(1+α·tanh(NN(x))); False = pure quadratic
+    activation: leaky_relu        # used only when use_nonlinear=True (auto-set to tanh for quadratic_times_tanh)
+    hidden_widths: [128, 128]
+    nn_scale: 0.5                 # α ∈ (0,1): multiplier range (1-α, 1+α) > 0
+
+  V_decrease_within_roa: True
+
+  limit_scale: [1]
+  domain_init_scale: auto      # derive initial domain from verified ROA bounding box
+  domain_init_margin: 1.05       # margin beyond ROA bbox (1.2 = 20% extra)
+  # V_psd_form: "quadratic_times_tanh"  # options: "quadratic", "quadratic_times_tanh", "quadratic_times_exp"
+  V_psd_form: "quadratic_times_tanh"  # options: "quadratic", "quadratic_times_tanh", "quadratic_times_exp"
+  rho_multiplier: [1]
+  limit: [0.6, 2]
+
+  dt: 0.01
+  velocity_integration: "ExplicitEuler"
+  position_integration: "MidPoint"
+
+  controller_nlayer: 2
+  controller_hidden_dim: 32
+  u_max: 0.24525
+
+train:
+  train_lyaloss: True
+  hard_max: True
+  num_samples_per_boundary: 1024
+  batch_size: 4096
+  epochs: 200
+  learning_rate: 1e-3
+  pgd_steps: 400
+  Vmin_x_pgd_buffer_size: 65136
+  buffer_size: 16384
+  samples_per_iter: 8192
+
+  max_iter: [200]
+
+  zubov_sampling: False
+  zubov_num_bands: 5
+  zubov_pgd_steps: 200
+  zubov_step_size: 0.01
+
+  domain_expansion: True
+  domain_update_interval: 500
+  domain_traj_steps: 2000
+  domain_num_trajectories: 10000
+  domain_convergence_thresh: 0.01
+  domain_max_growth: 1.5
+
+loss:
+  s_scale: 1.0
+  candidate_roa_states_weight: 0.1
+  l1_reg: 0
+  Vmin_x_boundary_weight: 0.0
+  Vmax_x_boundary_weight: 0.0
+  candidate_roa_states:
+    - [0, 0]
+  always_candidate_roa_regulizer: True
