@@ -58,6 +58,7 @@ class NeuralNetworkLyapunov(nn.Module):
         nominal: typing.Optional[typing.Callable[[torch.Tensor], torch.Tensor]] = None,
         V_psd_form: str = "L1",
         use_nonlinear: bool = True,
+        nn_scale: float = 0.5,
         *args,
         **kwargs
     ):
@@ -72,8 +73,13 @@ class NeuralNetworkLyapunov(nn.Module):
           eps: Minimum eigenvalue for PSD term.
           activation: Activation function for NN.
           nominal: Fixed nominal Lyapunov component.
-          V_psd_form: "quadratic", "L1", or "L1_R_free".
+          V_psd_form: "quadratic", "L1", "L1_R_free",
+            "quadratic_times_tanh" (V = x'Px · (1+α·tanh(NN)), α=nn_scale), or
+            "quadratic_times_exp"  (V = x'Px · exp(NN)).
+            Any "quadratic_times_*" form: NN zero-init ⇒ multiplier=1 at init.
           use_nonlinear: Whether to include the NN component.
+          nn_scale: α for "quadratic_times_tanh" — multiplier ∈ (1-α, 1+α).
+            Must be in (0,1) for that form. Ignored for "quadratic_times_exp".
         """
         super().__init__(*args, **kwargs)
         self.goal_state = goal_state
@@ -82,6 +88,9 @@ class NeuralNetworkLyapunov(nn.Module):
         self.V_psd_form = V_psd_form
         self.eps = eps
         self.use_nonlinear = use_nonlinear
+        if V_psd_form == "quadratic_times_tanh":
+            assert 0 < nn_scale < 1, f"nn_scale must be in (0,1) for quadratic_times_tanh, got {nn_scale}"
+        self.nn_scale = nn_scale
         
         # Linear/Quadratic components (R matrices)
         if R_frozen is not None:
@@ -105,6 +114,13 @@ class NeuralNetworkLyapunov(nn.Module):
                 if isinstance(l, nn.Linear):
                     torch.nn.init.kaiming_uniform_(l.weight, nonlinearity="relu")
             
+            # For all quadratic_times_* modes, zero-init the last linear layer
+            # so that NN(x) = 0 at init → multiplier = 1 → V = x^T P x exactly.
+            if V_psd_form.startswith("quadratic_times_"):
+                last_linear = layers[-1]  # last element is always Linear
+                nn.init.zeros_(last_linear.weight)
+                nn.init.zeros_(last_linear.bias)
+
             self.net = nn.Sequential(*layers)
         else:
             self.net = None
@@ -129,12 +145,15 @@ class NeuralNetworkLyapunov(nn.Module):
         v_psd = torch.zeros((*x.shape[:-1], 1), device=x.device, dtype=x.dtype)
         
         # Base epsilon term for strictly positive definiteness
-        if self.eps > 0 and self.V_psd_form == "quadratic":
+        # All quadratic_times_* forms share the same x'Px base.
+        _is_quad = (self.V_psd_form == "quadratic"
+                    or self.V_psd_form.startswith("quadratic_times_"))
+        if self.eps > 0 and _is_quad:
             v_psd += self.eps * torch.sum(x_diff ** 2, dim=-1, keepdim=True)
             
         def compute_term(R_mat, form):
             if R_mat is None: return 0
-            if form == "quadratic":
+            if form == "quadratic" or form.startswith("quadratic_times_"):
                 return torch.sum((x_diff @ R_mat.T) ** 2, dim=-1, keepdim=True)
             elif form == "L1":
                 # (eps*I + R^TR)x handled differently here for L1
@@ -153,7 +172,14 @@ class NeuralNetworkLyapunov(nn.Module):
 
         network_output = self._network_output(x)
         V_psd_output = self._V_psd_output(x)
-        if self.absolute_output:
+
+        if self.V_psd_form.startswith("quadratic_times_"):
+            if self.net is None:
+                # use_nonlinear=False: pure quadratic, no NN in the graph
+                return V_nominal + V_psd_output
+            else:
+                return V_nominal + V_psd_output * self._compute_multiplier(network_output)
+        elif self.absolute_output:
             return (
                 V_nominal
                 + torch.nn.functional.relu(network_output)
@@ -162,6 +188,22 @@ class NeuralNetworkLyapunov(nn.Module):
             )
         else:
             return V_nominal + network_output + V_psd_output
+
+    def _compute_multiplier(self, network_output: torch.Tensor) -> torch.Tensor:
+        """Multiplier applied to the quadratic base V = x'Px.
+
+        Dispatches on the suffix of V_psd_form:
+          quadratic_times_tanh  → 1 + α·tanh(NN(x) - NN(0))  ∈ (1-α, 1+α) > 0
+          quadratic_times_exp   → exp(NN(x) - NN(0))          always > 0
+        Both equal 1 at initialisation (zero-init last layer → NN(x)=0).
+        """
+        suffix = self.V_psd_form[len("quadratic_times_"):]
+        if suffix == "tanh":
+            return 1.0 + self.nn_scale * torch.tanh(network_output)
+        elif suffix == "exp":
+            return torch.exp(network_output)
+        else:
+            raise ValueError(f"Unknown quadratic_times_* suffix: '{suffix}'")
 
     def _apply(self, fn):
         """Handles CPU/GPU transfer and type conversion."""
