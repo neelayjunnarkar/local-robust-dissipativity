@@ -646,6 +646,117 @@ def create_pendulum_l2gain_verification_model(
     return wrapped_model
 
 
+def create_pendulum_rinn_state_feedback_model(
+    dt=0.01,
+    gamma=100.0,
+    w_max=0.024525,
+    rho=0.069,
+    s_scale=1.0,
+    rinn_parameters=None,
+    lyapunov_parameters=None,
+    output_C=None,
+    verification_mode='combined',
+):
+    """
+    Create pendulum state-feedback verification model with RINN controller.
+
+    Builds the full augmented dynamics [x_p, x_k] with dissipativity (L2-gain)
+    verification.  ρ is baked into the model's min/max condition, so the VNNLIB
+    spec only needs to assert output ≥ 0 (no external level-set constraint).
+
+    The verifier input is [ξ, w] where ξ = [x_p, x_k] (4D) and w is the
+    disturbance (1D), totalling 5D.  Output: single scalar (1D).
+
+    Condition verified for all (ξ, w) in box:
+        max{V(ξ)-ρ, min{V(ξ)-V(ξ⁺)+α·s(w,z), ρ-V(ξ⁺)}} ≥ 0
+
+    Weights are loaded by α,β-CROWN via the ``model.path`` config field.
+
+    Args:
+        dt: Discretisation time step.
+        gamma: L2-gain bound.
+        w_max: Scalar disturbance bound |w| ≤ w_max.
+        rho: Fixed ROA sublevel set value (for bisection).
+        s_scale: Supply rate scaling factor.
+        rinn_parameters: Dict with RINN matrices and config.
+        lyapunov_parameters: Dict with Lyapunov function config.
+        output_C: Performance output matrix z = C_z * x_p.
+    """
+    # -- plant dynamics --
+    pend_ct = pendulum.PendulumDynamics(
+        m=0.15, l=0.5, beta=0.1,
+        output_C=torch.tensor(output_C) if output_C is not None else None,
+    )
+    plant = dynamical_system.SecondOrderDiscreteTimeSystem(
+        pend_ct, dt,
+        position_integration=dynamical_system.IntegrationMethod.MidPoint,
+        velocity_integration=dynamical_system.IntegrationMethod.ExplicitEuler,
+    )
+
+    n_plant = plant.nx  # 2
+    nw = pend_ct.nw     # 1
+
+    # -- RINN controller (trainable=True + freeze_dvw to match training state_dict) --
+    rp = rinn_parameters or {}
+    _t = lambda v: torch.tensor(v, dtype=torch.float32) if not isinstance(v, torch.Tensor) else v
+
+    rinn_ctrl = controllers.RINNController(
+        A=_t(rp['A']),   Bw=_t(rp['Bw']),  By=_t(rp['By']),
+        Cv=_t(rp['Cv']),  Dvw=_t(rp['Dvw']), Dvy=_t(rp['Dvy']),
+        Cu=_t(rp['Cu']),  Duw=_t(rp['Duw']), Duy=_t(rp['Duy']),
+        n_plant=n_plant, dt=dt,
+        output_fn=None,
+        trainable=True,
+        freeze_dvw_lower_tri=True,
+        activation=rp.get('activation', 'relu'),
+        clip_output='clamp' if 'u_lo' in rp else None,
+        u_lo=_t(rp['u_lo']) if 'u_lo' in rp else None,
+        u_up=_t(rp['u_up']) if 'u_up' in rp else None,
+    )
+
+    # -- augmented dynamics --
+    aug_dyn = dynamical_system.AugmentedRINNDynamics(plant, rinn_ctrl)
+    nx = aug_dyn.nx  # n_plant + n_k
+
+    # -- Lyapunov function --
+    # Ensure R_trainable and R_frozen exist so state_dict keys match the training checkpoint.
+    lp = dict(lyapunov_parameters or {})
+    if 'R_trainable' not in lp:
+        lp['R_trainable'] = torch.zeros(nx, nx)
+    if 'R_frozen' not in lp:
+        lp['R_frozen'] = torch.zeros(nx, nx)
+    lyap_nn = lyapunov.NeuralNetworkLyapunov(
+        goal_state=aug_dyn.x_equilibrium,
+        x_dim=nx,
+        **lp,
+    )
+
+    # -- supply rate & loss --
+    supply_fn = supply_rate.L2GainSupplyRate(gamma=gamma)
+    loss_fn = lyapunov.DissipativityDerivativeLoss(
+        dynamics=aug_dyn,
+        controller=rinn_ctrl,
+        lyap_nn=lyap_nn,
+        supply_rate=supply_fn,
+        box_lo=torch.zeros(nx),
+        box_up=torch.zeros(nx),
+        rho_multiplier=1.0,
+        w_max=torch.tensor([w_max]),
+        beta=100,
+        hard_max=True,
+        s_scale=s_scale,
+        relu_minmax=True,  # auto_LiRPA backward compatibility
+        verification_mode=verification_mode,
+    )
+
+    # Bake in the fixed ρ (survives ABCROWN's load_state_dict since it's a plain attr)
+    loss_fn._fixed_rho = rho
+
+    # Return loss_fn directly — its forward() handles joint [ξ, w] input
+    # and ABCROWN loads weights via model.path config field.
+    return loss_fn
+
+
 def create_path_tracking_model(dt=0.05, **kwargs):
     """
     Build the computational graph for verification of the inverted pendulum model.

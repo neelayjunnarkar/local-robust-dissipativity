@@ -507,7 +507,7 @@ class RINNController(nn.Module):
 
         # State equation (continuous): ẋ_k = A x_k + Bw w + By y
         # Discretised: x_k+ = (I + dt·A) x_k + dt·Bw w + dt·By y
-        A_kd = torch.eye(n_k, dtype=A.dtype) + dt * A
+        A_kd = torch.eye(n_k, dtype=A.dtype, device=A.device) + dt * A
         Bw_kd = dt * Bw
         By_kd = dt * By
 

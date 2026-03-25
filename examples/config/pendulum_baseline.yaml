@@ -1,0 +1,186 @@
+# =============================================================================
+# Pendulum RINN Baseline — quadratic×tanh Lyapunov, [32,32] NN
+# =============================================================================
+# Best configuration from formal verification experiments (qt_nn32_fns_tc).
+# Results: init_crown=0.431, final_crown=0.932, final_pgd=1.017
+#
+# V(x) = x^T P x · (1 + 0.5·tanh(NN(x)))   with NN = [32,32] LeakyReLU
+# Controller: RINN n_w=8 ReLU, trainable (CROWN-friendly)
+# Lyapunov: frozen quadratic + trainable quadratic + nonlinear tanh
+# Training domain: θ∈[-3,3], θ̇∈[-9,9], controller limit: [-4,4]
+# Formal verification enabled (CROWN + PGD bisection)
+# =============================================================================
+
+wandb_name: pendulum_baseline
+defaults:
+  - user: pendulum_state_training_default
+  - train_template
+
+hydra:
+  run:
+    dir: ${user.run_dir}
+  sweep:
+    dir: ${user.run_dir}
+
+use_sdp_init: False
+approximate_lqr: False
+
+verify_init: True
+seed: 0
+use_init_roa_anchors: True
+init_roa_num_anchors: 1024
+init_roa_anchor_expand: 1.3
+init_roa_anchor_weight: 0.1
+
+supply_rate:
+  type: l2gain
+  gamma: 100
+  w_max: 0.0750465
+pgd_verifier_steps: 350
+pgd_verifier_num_seeds: 3
+pgd_verifier_stop_early: False
+
+model:
+  normalize_coordinates: False
+
+  P_init: [[ 1.5211e-02,  1.1826e-03, -3.9104e-05,  7.0204e-05],
+           [ 1.1826e-03,  1.1001e-03,  1.4486e-04,  5.6436e-05],
+           [-3.9104e-05,  1.4486e-04,  1.3817e-02,  4.1302e-03],
+           [ 7.0204e-05,  5.6436e-05,  4.1302e-03,  3.8687e-03]]
+
+  K_init: null
+
+  output_C: [[1.0, 0.0],
+             [0.0, 1.0]]
+
+  controller:
+    type: rinn
+    rinn:
+      n_k: 2
+      n_w: 8
+      activation: relu
+
+      A:   [[-3.1509, -1.4492],
+            [-1.1005, -0.6330]]
+      Bw:  [[ 0.0236, -0.0235, -0.0235,  0.0245,  0.0232, -0.0232,  0.0236, -0.0231],
+            [ 0.0219, -0.0219, -0.0218,  0.0229,  0.0215, -0.0215,  0.0221, -0.0214]]
+      By:  [[-0.0151,  0.0151],
+            [-0.0204,  0.0978]]
+      Cv:  [[ 0.0188, -0.0085],
+            [-0.0185,  0.0083],
+            [-0.0188,  0.0085],
+            [ 0.0250, -0.0127],
+            [ 0.0210, -0.0100],
+            [-0.0193,  0.0090],
+            [ 0.0228, -0.0111],
+            [-0.0192,  0.0090]]
+      Dvw: [[ 0.0000, -0.0327, -0.0327,  0.0348,  0.0327, -0.0323,  0.0332, -0.0320],
+            [ 0.0000,  0.0000,  0.0327, -0.0348, -0.0327,  0.0323, -0.0332,  0.0320],
+            [ 0.0000,  0.0000,  0.0000, -0.0348, -0.0327,  0.0323, -0.0332,  0.0320],
+            [ 0.0000,  0.0000,  0.0000,  0.0000,  0.0313, -0.0304,  0.0322, -0.0302],
+            [ 0.0000,  0.0000,  0.0000,  0.0000,  0.0000, -0.0319,  0.0331, -0.0316],
+            [ 0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000, -0.0333,  0.0321],
+            [ 0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000, -0.0309],
+            [ 0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000]]
+      Dvy: [[-0.0063,  0.0235],
+            [ 0.0065, -0.0234],
+            [ 0.0063, -0.0235],
+            [-0.0072,  0.0275],
+            [-0.0059,  0.0248],
+            [ 0.0057, -0.0238],
+            [-0.0066,  0.0259],
+            [ 0.0056, -0.0238]]
+      Cu:  [[ 0.0906,  0.0395]]
+      Duw: [[ 0.0342, -0.0338, -0.0340,  0.0353,  0.0343, -0.0346,  0.0338, -0.0344]]
+      Duy: [[-2.7673, -2.1278]]
+
+      controller_limit: [4, 4]
+      trainable: True
+      freeze_dvw_lower_tri: True
+
+  lyapunov:
+    use_frozen_quadratic: True
+    use_trainable_quadratic: True
+    use_nonlinear: True
+    activation: leaky_relu
+    hidden_widths: [128, 128]
+    nn_scale: 0.5
+    learnable_nn_scale: False
+    absolute_output: True
+
+  V_decrease_within_roa: True
+
+  limit_scale: [1]
+  domain_init_scale: auto
+  domain_init_margin: 1.05
+  V_psd_form: "quadratic_times_tanh"
+  rho_multiplier: [1]
+  limit: [3, 9]
+
+  dt: 0.01
+  velocity_integration: "ExplicitEuler"
+  position_integration: "MidPoint"
+
+  controller_nlayer: 2
+  controller_hidden_dim: 32
+  u_max: 0.750465
+
+train:
+  device: cuda
+  train_lyaloss: True
+  hard_max: True
+  num_samples_per_boundary: 512
+  batch_size: 131072
+  epochs: 200
+  learning_rate: 1e-3
+  pgd_steps: 300
+  Vmin_x_pgd_buffer_size: 131072
+  buffer_size: 65536
+  samples_per_iter: 32768
+
+  max_iter: [200]
+
+  domain_expansion: True
+  domain_update_interval: 500
+  domain_traj_steps: 1000
+  domain_num_trajectories: 5000
+  domain_convergence_thresh: 0.01
+  domain_max_growth: 1.5
+
+loss:
+  s_scale: 1.0
+  learnable_s_scale: True
+  candidate_roa_states_weight: 0.1
+  l1_reg: 0
+  Vmin_x_boundary_weight: 0.0
+  Vmax_x_boundary_weight: 0.0
+  candidate_roa_states:
+    - [0, 0]
+  always_candidate_roa_regulizer: True
+  c1_threshold: 0.0
+
+# =============================================================================
+# Formal Verification — GPU-accelerated CROWN + PGD bisection
+# =============================================================================
+formal_verification:
+  enabled: False
+  verify_initial: True
+  init_pure_quadratic: True
+  verify_final: True
+  timeout: 120
+  rho_eps: 0.02
+  max_bisect_iters: 7
+  hole_size: 0.1
+  # smart_bracket=True + bracket_shift=0.95:
+  #   First CROWN probe at 0.95×pgd_rho (high success rate, avoids OOM at full pgd).
+  #   If safe  → bracket = [0.95×pgd, rho_multiplier×pgd] (bisect upward).
+  #   If unsafe → bracket = [pgd/rho_multiplier, 0.95×pgd] (bisect downward).
+  smart_bracket: True
+  bracket_shift: 0.95
+  rho_multiplier: 1.25
+  device: cuda
+  batch_size: 32768
+  pgd_restarts: 10000
+  domain_tightening: True
+  tightening_samples: 500000
+  tightening_margin: 1.05

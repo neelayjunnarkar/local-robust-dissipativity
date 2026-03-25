@@ -1,8 +1,4 @@
 import os
-import pdb
-
-# Set wandb API key
-os.environ["WANDB_API_KEY"] = "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"
 
 import argparse
 import copy
@@ -11,6 +7,7 @@ import logging
 import matplotlib.pyplot as plt
 import numpy as np
 from omegaconf import DictConfig, OmegaConf, ListConfig
+import random
 import scipy.linalg
 import torch
 import torch.nn as nn
@@ -170,7 +167,8 @@ def sample_init_roa_anchors(
     nx: int,
     num_anchors: int = 256,
     expand_factor: float = 1.5,
-    num_candidates: int = 500_000,
+    num_candidates: int = 5_000_000,
+    n_plant: int = None,
     logger=None,
 ) -> torch.Tensor:
     """
@@ -192,14 +190,105 @@ def sample_init_roa_anchors(
         * (upper_limit - lower_limit)
         + lower_limit
     )
-    V_vals = lyapunov_nn(x_cand).squeeze(-1)
 
-    # Boundary band: V ∈ [0.7ρ, ρ]
-    bdry_mask = (V_vals >= 0.7 * init_rho) & (V_vals <= init_rho)
+    # 1. Apply the band condition on the full 4D Neural Network V(x) FIRST
+    with torch.no_grad():
+        V_vals_full = lyapunov_nn(x_cand).squeeze(-1)
+        
+    # Boundary band: V ∈ [0.75ρ, ρ]
+    bdry_mask_full = (V_vals_full >= 0.75 * init_rho) & (V_vals_full <= init_rho)
+    # Beyond band: V ∈ [ρ, α·ρ]
+    beyond_mask_full = (V_vals_full > init_rho) & (V_vals_full <= expand_factor * init_rho)
+    
+    # Filter candidates to only those within the two spatial bands
+    valid_band_mask = bdry_mask_full | beyond_mask_full
+    x_cand = x_cand[valid_band_mask]
+    V_vals_full = V_vals_full[valid_band_mask]
+
+    if n_plant is not None and n_plant < nx and x_cand.shape[0] > 0:
+        with torch.no_grad():
+            # Calculate analytical projection of 4D P matrix onto plant state
+            P = get_effective_P(lyapunov_nn, device=device)
+            if P is None:
+                # Pure-NN forms: skip P-based projection filtering
+                pass
+            else:
+                # Exact projection onto plant states via Schur complement
+                P11 = P[:n_plant, :n_plant]
+                P12 = P[:n_plant, n_plant:]
+                P21 = P[n_plant:, :n_plant]
+                P22 = P[n_plant:, n_plant:]
+                P_proj = P11 - P12 @ torch.linalg.inv(P22) @ P21
+
+                # 2. Project to plant state (implicitly by evaluating only plant dims)
+                x_plant = x_cand[:, :n_plant]
+                
+                # 3. Filter using projection: remove points safely inside the 0.75 boundary
+                v_proj = (x_plant @ P_proj * x_plant).sum(dim=1)
+                outside_mask = v_proj > 0.75 * init_rho
+                
+                # 4. Lift remaining points back (by keeping their old 4D coordinates)
+                x_cand = x_cand[outside_mask]
+                V_vals_full = V_vals_full[outside_mask]
+
+                if logger is not None:
+                    logger.info(f"\n[Anchor Logic] Filtered candidate anchors down to {x_cand.shape[0]} "
+                                f"using the projected boundaries: removed points inside 0.75 * rho_0 (rho_0={init_rho:.5f}).")
+                    
+                    try:
+                        import matplotlib.pyplot as plt
+                        import os
+                        fig, ax = plt.subplots(figsize=(7, 6))
+                        
+                        # Plot a subset to avoid huge image files (up to 5000 points)
+                        plot_cand = x_cand[:5000].cpu().numpy()
+                        if plot_cand.shape[0] > 0:
+                            ax.scatter(plot_cand[:, 0], plot_cand[:, 1], s=2, alpha=0.3, color='blue',
+                                       label='Remaining Samples (proj 2D)', zorder=1)
+                        
+                        # Grid for exact quadratic contour
+                        lo_np = lower_limit.cpu().numpy()
+                        hi_np = upper_limit.cpu().numpy()
+                        x_grid = np.linspace(lo_np[0], hi_np[0], 200)
+                        y_grid = np.linspace(lo_np[1], hi_np[1], 200)
+                        XX, YY = np.meshgrid(x_grid, y_grid)
+                        grid_pts = np.c_[XX.ravel(), YY.ravel()]
+                        grid_tf = torch.tensor(grid_pts, dtype=torch.float32, device=device)
+                        
+                        if n_plant > 2:
+                            padding = torch.zeros((grid_tf.shape[0], n_plant - 2), device=device)
+                            grid_tf_eval = torch.cat([grid_tf, padding], dim=1)
+                        else:
+                            grid_tf_eval = grid_tf
+                            
+                        v_grid = (grid_tf_eval @ P_proj * grid_tf_eval).sum(dim=1).view(200, 200).cpu().numpy()
+                        
+                        ax.contour(XX, YY, v_grid, levels=[0.75 * init_rho], colors='red', linewidths=2, zorder=5)
+                        ax.contour(XX, YY, v_grid, levels=[init_rho], colors='black', linestyles='dashed', linewidths=2, zorder=5)
+                        
+                        from matplotlib.lines import Line2D
+                        custom_lines = [
+                            Line2D([0], [0], marker='o', color='w', markerfacecolor='blue', markersize=6, alpha=0.5, label='Filtered Point Cloud'),
+                            Line2D([0], [0], color='red', lw=2, label=r'Exclusion Cutoff: $x_p^T P_{proj} x_p = 0.75\rho_0$'),
+                            Line2D([0], [0], color='black', lw=2, ls='dashed', label=r'Initial ROA: $x_p^T P_{proj} x_p = 1.0\rho_0$')
+                        ]
+                        ax.legend(handles=custom_lines, loc='upper right', fontsize=9)
+                        ax.set_xlabel('Plant State 1')
+                        ax.set_ylabel('Plant State 2')
+                        ax.set_title('Anchor Point Sampling vs Analytical P-Matrix Projection')
+                        
+                        plot_path = os.path.join(os.getcwd(), "anchor_sampling_projection.png")
+                        fig.savefig(plot_path, dpi=150)
+                        plt.close(fig)
+                        logger.info(f"Saved exact anchor bounds diagnostic to {plot_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to plot anchor projection: {e}")
+
+    # Now split the resulting filtered candidates into our two targeted buckets
+    bdry_mask = (V_vals_full >= 0.75 * init_rho) & (V_vals_full <= init_rho)
     bdry_pts = x_cand[bdry_mask]
 
-    # Beyond band: V ∈ [ρ, α·ρ]
-    beyond_mask = (V_vals > init_rho) & (V_vals <= expand_factor * init_rho)
+    beyond_mask = (V_vals_full > init_rho) & (V_vals_full <= expand_factor * init_rho)
     beyond_pts = x_cand[beyond_mask]
 
     # Fill each band up to budget; overflow goes to the other band
@@ -306,165 +395,12 @@ def approximate_lqr(
     approximate(lyapunov_nn, x, V, lr=0.01, max_iter=1000)
 
 
-def plot_V(V, lower_limit, upper_limit, S_norm=None):
-    # If S_norm is provided, lower/upper_limit are in z-space.
-    x_ticks = torch.linspace(lower_limit[0], upper_limit[0], 50, device=device)
-    y_ticks = torch.linspace(lower_limit[1], upper_limit[1], 50, device=device)
-    grid_x, grid_y = torch.meshgrid(x_ticks, y_ticks, indexing='ij')
-    with torch.no_grad():
-        V_val = V(torch.stack((grid_x, grid_y), dim=2)).squeeze(2)
-
-    fig = plt.figure()
-    ax = fig.add_subplot(projection="3d")
-    ax.plot_surface(grid_x.cpu().numpy(), grid_y.cpu().numpy(), V_val.cpu().numpy())
-    if S_norm is not None:
-        ax.set_xlabel(r"$z_1$")
-        ax.set_ylabel(r"$z_2$")
-    else:
-        ax.set_xlabel(r"$\theta (rad)$")
-        ax.set_ylabel(r"$\dot{\theta} (rad/s)$")
-    ax.set_zlabel("V")
-    return fig, ax
-
-
-def plot_V_heatmap(V, lower_limit, upper_limit, rho, dynamics=None, trajectories=None):
-    # If dynamics is NOT provided, it's just the old physical space plotting.
-    # If dynamics IS provided, lower_limit/upper_limit are in z-space.
-    
-    if dynamics is None:
-        # Standard physical plotting
-        x_ticks = torch.linspace(lower_limit[0], upper_limit[0], 1000, device=device)
-        y_ticks = torch.linspace(lower_limit[1], upper_limit[1], 1000, device=device)
-        grid_x, grid_y = torch.meshgrid(x_ticks, y_ticks, indexing='ij')
-        with torch.no_grad():
-            V_val = V.forward(torch.stack((grid_x, grid_y), dim=2)).squeeze(2)
-        
-        fig, ax = plt.subplots(1, 1, figsize=(8, 7))
-        im = ax.pcolormesh(grid_x.cpu(), grid_y.cpu(), V_val.cpu(), shading='auto')
-        ax.contour(grid_x.cpu(), grid_y.cpu(), V_val.cpu(), [rho], colors="red", linewidths=2)
-        
-        if trajectories is not None:
-            traj_data = trajectories.cpu().detach().numpy()
-            if traj_data.ndim == 2:
-                ax.plot(traj_data[:, 0], traj_data[:, 1], color='white', alpha=0.8, linewidth=1)
-            else:
-                for i in range(traj_data.shape[1]):
-                     ax.plot(traj_data[:, i, 0], traj_data[:, i, 1], alpha=0.5, linewidth=0.5)
-
-        ax.set_xlabel(r"$\theta$ (rad)")
-        ax.set_ylabel(r"$\dot{\theta}$ (rad/s)")
-        ax.set_title(f"Lyapunov V (Physical Coordinates), ρ={rho:.4f}")
-        ax.grid(True, alpha=0.3)
-        fig.colorbar(im, ax=ax)
-        return fig, ax, None
-
-    # Dual Plotting Mode (Normalized Error Coordinates)
-    fig, (ax_z, ax_x) = plt.subplots(1, 2, figsize=(16, 7))
-    
-    # 1. z-space plot (Normalized)
-    z_ticks_1 = torch.linspace(lower_limit[0], upper_limit[0], 500, device=device)
-    z_ticks_2 = torch.linspace(lower_limit[1], upper_limit[1], 500, device=device)
-    grid_z1, grid_z2 = torch.meshgrid(z_ticks_1, z_ticks_2, indexing='ij')
-    z_pts = torch.stack((grid_z1, grid_z2), dim=2)
-    with torch.no_grad():
-        V_z = V.forward(z_pts).squeeze(-1) 
-    
-    im_z = ax_z.pcolormesh(grid_z1.cpu(), grid_z2.cpu(), V_z.cpu(), shading='auto')
-    ax_z.contour(grid_z1.cpu(), grid_z2.cpu(), V_z.cpu(), [rho], colors="red", linewidths=2)
-    
-    if trajectories is not None:
-        # trajectories in z-space
-        z_traj_data = trajectories.cpu().detach().numpy()
-        N_steps = z_traj_data.shape[0]
-        if z_traj_data.ndim == 2:
-            for t in range(N_steps - 1):
-                ax_z.plot(z_traj_data[t:t+2, 0], z_traj_data[t:t+2, 1], alpha=0.8)
-        else:
-            for i in range(z_traj_data.shape[1]):
-                for t in range(N_steps - 1):
-                    ax_z.plot(z_traj_data[t:t+2, i, 0], z_traj_data[t:t+2, i, 1], alpha=0.5)
-
-    ax_z.set_xlabel(r"$z_1$ (Norm. Error Pos)")
-    ax_z.set_ylabel(r"$z_2$ (Norm. Error Vel)")
-    ax_z.set_title(f"Normalized z-space (Energy Units), ρ={rho:.6f}")
-    ax_z.set_aspect('equal')
-    ax_z.grid(True, alpha=0.3)
-    
-    # Draw z-box boundary (Rectangle)
-    from matplotlib.patches import Rectangle
-    rect_z = Rectangle((lower_limit[0].cpu(), lower_limit[1].cpu()), 
-                       (upper_limit[0]-lower_limit[0]).cpu(), 
-                       (upper_limit[1]-lower_limit[1]).cpu(),
-                       linewidth=2, edgecolor='white', facecolor='none', linestyle='--', label='Training Box')
-    ax_z.add_patch(rect_z)
-    fig.colorbar(im_z, ax=ax_z)
-
-    # 2. x-space plot (Physical)
-    # Map physical limits based on z-box corners (Ordered for Polygon)
-    corners_z = torch.tensor([
-        [lower_limit[0], lower_limit[1]], # bl
-        [upper_limit[0], lower_limit[1]], # br
-        [upper_limit[0], upper_limit[1]], # tr
-        [lower_limit[0], upper_limit[1]]  # tl
-    ], device=device)
-    
-    corners_x = dynamics._z_to_x(corners_z)
-    
-    x_min_box, _ = corners_x.min(dim=0)
-    x_max_box, _ = corners_x.max(dim=0)
-    
-    # Tight bounding box with 10% margin
-    x_range_box = x_max_box - x_min_box
-    plot_x_min = x_min_box - 0.1 * x_range_box
-    plot_x_max = x_max_box + 0.1 * x_range_box
-    
-    x_ticks_1 = torch.linspace(plot_x_min[0].item(), plot_x_max[0].item(), 500, device=device)
-    x_ticks_2 = torch.linspace(plot_x_min[1].item(), plot_x_max[1].item(), 500, device=device)
-    grid_x1, grid_x2 = torch.meshgrid(x_ticks_1, x_ticks_2, indexing='ij')
-    x_pts_phys = torch.stack((grid_x1, grid_x2), dim=2)
-    
-    # x -> z -> V: 
-    z_pts_from_x = dynamics._x_to_z(x_pts_phys)
-    with torch.no_grad():
-        V_x = V.forward(z_pts_from_x).squeeze(-1)
-    
-    im_x = ax_x.pcolormesh(grid_x1.cpu(), grid_x2.cpu(), V_x.cpu(), shading='auto')
-    ax_x.contour(grid_x1.cpu(), grid_x2.cpu(), V_x.cpu(), [rho], colors="red", linewidths=2)
-    
-    if trajectories is not None:
-        # trajectories in x-space via wrapper mapping
-        x_traj_data = dynamics._z_to_x(trajectories).cpu().detach().numpy()
-        if x_traj_data.ndim == 2:
-            for t in range(N_steps - 1):
-                ax_x.plot(x_traj_data[t:t+2, 0], x_traj_data[t:t+2, 1], alpha=0.8)
-        else:
-            for i in range(x_traj_data.shape[1]):
-                for t in range(N_steps - 1):
-                    ax_x.plot(x_traj_data[t:t+2, i, 0], x_traj_data[t:t+2, i, 1], alpha=0.5)
-
-    # Draw rotated training box in x-space (Rotated Rectangle via Eigen-Norm)
-    from matplotlib.patches import Polygon
-    poly_x = Polygon(corners_x.cpu().numpy(), linewidth=2, edgecolor='white', facecolor='none', linestyle='--', label='Training Box')
-    ax_x.add_patch(poly_x)
-    
-    ax_x.set_xlabel(r"$\theta$ (rad)")
-    ax_x.set_ylabel(r"$\dot{\theta}$ (rad/s)")
-    ax_x.set_title(f"Physical x-space (Centered at Upright), ρ={rho:.6f}")
-    ax_x.set_xlim(plot_x_min[0].item(), plot_x_max[0].item())
-    ax_x.set_ylim(plot_x_min[1].item(), plot_x_max[1].item())
-    # ax_x.set_aspect('equal') # Essential for "rotated box" shape visualization
-    ax_x.grid(True, alpha=0.3)
-    fig.colorbar(im_x, ax=ax_x)
-    
-    plt.tight_layout()
-    return fig, (ax_z, ax_x), None
-
-
 ACTIVATION_MAP = {
     "relu": nn.ReLU,
     "leaky_relu": nn.LeakyReLU,
     "tanh": nn.Tanh,
     "sigmoid": nn.Sigmoid,
+    "gelu": nn.GELU,
 }
 
 
@@ -489,6 +425,8 @@ def pgd_find_verified_rho(
     rho_bisect_tol=0.0001,
     max_bisect_iters=20,
     logger=None,
+    c1_threshold=0.0,
+    c1_multiplier=0.0,
 ):
     """Find the largest PGD-verified rho for the current model state.
 
@@ -545,6 +483,7 @@ def pgd_find_verified_rho(
             box_lo=lower_limit, box_up=upper_limit,
             rho_multiplier=rho_mult,
             w_max=w_max, hard_max=True, s_scale=s_scale,
+            c1_threshold=c1_threshold, c1_multiplier=c1_multiplier,
         )
         loss_fn.x_boundary = x_boundary
 
@@ -552,7 +491,7 @@ def pgd_find_verified_rho(
         if use_adv_w:
             nw = getattr(dynamics.continuous_time_system, 'nw', 1) if hasattr(dynamics, 'continuous_time_system') else 1
             ver_loss = lyapunov.DissipativityVerificationWrapper(loss_fn, nx, nw)
-            limit_w = w_max
+            limit_w = w_max.to(limit.device)
             limit_joint = torch.cat([limit, limit_w])
             lower_joint = torch.cat([lower_limit, -limit_w])
             upper_joint = torch.cat([upper_limit, limit_w])
@@ -704,6 +643,184 @@ def simulate_closed_loop(
     return torch.stack(traj, dim=0)   # (T+1, N, nx)
 
 
+def get_effective_P(lyapunov_nn, device=None):
+    """Compute effective P matrix from a Lyapunov network, or None for pure-NN forms."""
+    if lyapunov_nn._is_pure_nn:
+        return None
+    if device is None:
+        device = next(lyapunov_nn.parameters()).device
+    nx = lyapunov_nn.x_dim
+    with torch.no_grad():
+        P = lyapunov_nn.eps * torch.eye(nx, device=device)
+        if hasattr(lyapunov_nn, 'R_frozen') and lyapunov_nn.R_frozen is not None:
+            P += lyapunov_nn.R_frozen.T @ lyapunov_nn.R_frozen
+        if hasattr(lyapunov_nn, 'R_trainable') and lyapunov_nn.R_trainable is not None:
+            P += lyapunov_nn.R_trainable.T @ lyapunov_nn.R_trainable
+    return P
+
+
+def pretrain_quadratic_imitation(
+    lyapunov_nn,
+    P_matrix: torch.Tensor,
+    lower_limit: torch.Tensor,
+    upper_limit: torch.Tensor,
+    V_psd_form: str,
+    n_samples: int = 100000,
+    n_steps: int = 50000,
+    lr: float = 1e-3,
+    logger=None,
+):
+    """Pre-train pure-NN Lyapunov network to imitate V_quad(x) = (x-x*)^T P (x-x*).
+
+    For nn_sigmoid: targets are normalized to (0, ~0.8) to fit the sigmoid range.
+    For nn_abs / nn_sq: targets are the raw quadratic values.
+    """
+    device = P_matrix.device
+    nx = lyapunov_nn.x_dim
+    goal = lyapunov_nn.goal_state.unsqueeze(0)  # (1, nx)
+
+    # Pre-compute V_max for normalization (evaluate on domain corners)
+    corner_coords = [torch.tensor([lower_limit[i].item(), upper_limit[i].item()],
+                                  device=device) for i in range(nx)]
+    corners = torch.stack(torch.meshgrid(*corner_coords, indexing='ij'), dim=-1).reshape(-1, nx)
+    V_corners = ((corners - goal) @ P_matrix * (corners - goal)).sum(dim=-1)
+    V_max = V_corners.max().item()
+
+    optimizer = torch.optim.Adam(lyapunov_nn.net.parameters(), lr=lr)
+    lyapunov_nn.train()
+
+    for step in range(n_steps):
+        x = lower_limit + (upper_limit - lower_limit) * torch.rand(n_samples, nx, device=device)
+        x_centered = x - goal
+        V_quad = (x_centered @ P_matrix * x_centered).sum(dim=-1, keepdim=True)
+
+        V_nn = lyapunov_nn(x)
+
+        if V_psd_form == "nn_sigmoid":
+            # Map quadratic values into sigmoid range (0.01, 0.81).
+            V_target = V_quad / (V_max + 1e-8) * 0.8 + 0.01
+        elif V_psd_form in ("nn_sigmoid_c1", "nn_sigmoid_abs"):
+            # For c₁-exclusion forms, use raw V_quad targets.
+            # This gives lower V(x*) ≈ 0.005 vs ρ ≈ 0.02, keeping
+            # the V(x*)/ρ ratio small enough for c₁ < ρ feasibility.
+            V_target = V_quad
+        else:
+            V_target = V_quad
+
+        loss = torch.nn.functional.mse_loss(V_nn, V_target)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if step % 100 == 0 and logger:
+            logger.info(f"  Imitation step {step}/{n_steps}: loss={loss.item():.6f}")
+
+    lyapunov_nn.eval()
+    if logger:
+        with torch.no_grad():
+            V_origin = lyapunov_nn(goal).item()
+            x_test = lower_limit + (upper_limit - lower_limit) * torch.rand(1000, nx, device=device)
+            V_test = lyapunov_nn(x_test)
+            logger.info(
+                f"  Imitation done. V(x*)={V_origin:.6f}, "
+                f"V range: [{V_test.min().item():.6f}, {V_test.max().item():.6f}]"
+            )
+
+
+def pretrain_decrease(
+    lyapunov_nn, dynamics, controller,
+    lower_limit, upper_limit,
+    kappa=0.001,
+    c1_frac=1.5,
+    n_steps=3000,
+    n_samples=50000,
+    lr=5e-4,
+    logger=None,
+):
+    """Pre-train Lyapunov NN for V decrease after imitation.
+
+    The imitation phase teaches V shape (≈ quadratic) but does not
+    guarantee the Lyapunov decrease V(f(x)) ≤ (1−κ)V(x).  For sigmoid-
+    based V with V(x*) > 0, this gap makes the init verified ρ collapse
+    to V(x*), leaving zero room for c₁ exclusion.
+
+    This phase fine-tunes the NN so that decrease approximately holds
+    in the band V ∈ [c₁, max_rho], while preserving V(x*).
+    """
+    device = next(lyapunov_nn.parameters()).device
+    nx = lower_limit.shape[0]
+    goal = lyapunov_nn.goal_state.unsqueeze(0)
+
+    with torch.no_grad():
+        V_star_init = lyapunov_nn(goal).item()
+    c1_value = c1_frac * V_star_init
+
+    optimizer = torch.optim.Adam(lyapunov_nn.net.parameters(), lr=lr)
+
+    # Freeze controller during decrease pre-training
+    ctrl_grads = {n: p.requires_grad for n, p in controller.named_parameters()}
+    for p in controller.parameters():
+        p.requires_grad_(False)
+
+    lyapunov_nn.train()
+
+    for step in range(n_steps):
+        x = lower_limit + (upper_limit - lower_limit) * torch.rand(
+            n_samples, nx, device=device
+        )
+
+        V_x = lyapunov_nn(x)
+
+        with torch.no_grad():
+            u = controller(x)
+            x_next = dynamics.forward(x, u)
+
+        V_next = lyapunov_nn(x_next.detach())
+
+        # Only penalize decrease violations outside c₁ zone
+        mask = (V_x.squeeze(-1) > c1_value).float().detach()
+        decrease_viol = torch.relu(
+            V_next.squeeze(-1) - (1 - kappa) * V_x.squeeze(-1)
+        )
+        decrease_loss = (decrease_viol * mask).sum() / (mask.sum() + 1)
+
+        # Keep V(x*) close to initial value
+        V_star = lyapunov_nn(goal)
+        origin_loss = (V_star.squeeze() - V_star_init) ** 2
+
+        loss = decrease_loss + 10.0 * origin_loss
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if step % 500 == 0 and logger:
+            n_active = int(mask.sum().item())
+            n_viol = int((decrease_viol * mask > 0).sum().item())
+            logger.info(
+                f"  Decrease step {step}/{n_steps}: loss={loss.item():.6f}, "
+                f"violations={n_viol}/{n_active}, V(x*)={V_star.item():.6f}"
+            )
+
+    # Restore controller grad flags
+    for n, p in controller.named_parameters():
+        p.requires_grad_(ctrl_grads[n])
+
+    lyapunov_nn.eval()
+    if logger:
+        with torch.no_grad():
+            V_origin = lyapunov_nn(goal).item()
+            x_test = lower_limit + (upper_limit - lower_limit) * torch.rand(
+                1000, nx, device=device
+            )
+            V_test = lyapunov_nn(x_test)
+            logger.info(
+                f"  Decrease pre-training done. V(x*)={V_origin:.6f}, "
+                f"V range: [{V_test.min().item():.6f}, {V_test.max().item():.6f}]"
+            )
+
+
 def compute_projected_levelset(
     lyapunov_nn: nn.Module,
     rho: float,
@@ -783,6 +900,33 @@ def compute_projected_levelset(
     return xi_vals, xj_vals, V_proj
 
 
+def compute_roa_volume_projected(
+    lyapunov_nn: nn.Module,
+    rho: float,
+    dim_i: int,
+    dim_j: int,
+    lower_limit: torch.Tensor,
+    upper_limit: torch.Tensor,
+    grid_size: int = 200,
+    n_opt_steps: int = 200,
+    lr: float = 0.05,
+) -> float:
+    """Compute area of the ROA projection onto the (dim_i, dim_j) plane.
+
+    Uses compute_projected_levelset and counts grid cells where V_proj <= rho.
+    Returns area in the original coordinate units.
+    """
+    xi_vals, xj_vals, V_proj = compute_projected_levelset(
+        lyapunov_nn, rho, dim_i, dim_j,
+        lower_limit, upper_limit,
+        grid_size=grid_size, n_opt_steps=n_opt_steps, lr=lr,
+    )
+    dx = xi_vals[1] - xi_vals[0]
+    dy = xj_vals[1] - xj_vals[0]
+    mask = V_proj <= rho
+    return float(mask.sum()) * dx * dy
+
+
 def plot_ellipsoid_projections(
     P_init: np.ndarray,
     rho_init: float,
@@ -795,32 +939,19 @@ def plot_ellipsoid_projections(
     lyapunov_final: nn.Module = None,
     lower_limit_tensor: torch.Tensor = None,
     upper_limit_tensor: torch.Tensor = None,
-    n_levelset_samples: int = 400_000,  # kept for API compat, unused
     proj_grid_size: int = 80,
     proj_opt_steps: int = 200,
+    extra_rho_levels: list = None,
 ) -> plt.Figure:
     """Plot all C(nx,2) projected ROA ellipses on a grid of 2-D panels.
 
     For each panel the *quadratic* ellipsoid {x : x^T P x ≤ ρ} is drawn via
     `project_ellipsoid`. When ``lyapunov_final`` is provided, the exact
-    nonlinear ROA projection boundary is overlaid: for each 2D grid point the
-    remaining dims are optimized away (batched Adam), giving the true
-    projection {(xi,xj) : min_{others} V(x) ≤ ρ}.
+    nonlinear ROA projection boundary is overlaid via batched Adam.
 
     Args:
-        P_init:              nx×nx Lyapunov matrix for initial model.
-        rho_init:            Verified ρ for initial model.
-        P_final:             nx×nx Lyapunov matrix for trained model.
-        rho_final:           Verified ρ for trained model.
-        nx:                  State dimension.
-        state_labels:        List of nx axis labels.
-        trajectories:        Optional (T, N, nx) tensor of trajectories.
-        title:               Figure suptitle.
-        lyapunov_final:      Trained NeuralNetworkLyapunov for nonlinear overlay.
-        lower_limit_tensor:  Lower box bound as torch.Tensor (nx,).
-        upper_limit_tensor:  Upper box bound as torch.Tensor (nx,).
-        proj_grid_size:      Grid resolution for exact projection.
-        proj_opt_steps:      Adam steps per grid point optimisation.
+        extra_rho_levels: Optional list of (rho, color, linestyle, label) tuples
+            for additional V(x)=ρ contours from ``lyapunov_final``.
     Returns:
         matplotlib Figure.
     """
@@ -837,13 +968,15 @@ def plot_ellipsoid_projections(
               else trajectories) if trajectories is not None else None  # (T, N, nx)
 
     # --- Pre-compute exact projected levelsets for the nonlinear V(x)=ρ ---
-    # Each entry: (xi_vals, xj_vals, V_proj) for the corresponding pair.
     proj_grids = {}
-    if (lyapunov_final is not None and rho_final > 0
+    need_proj = rho_final > 0 or (extra_rho_levels and any(r > 0 for r, *_ in extra_rho_levels))
+    if (lyapunov_final is not None and need_proj
             and lower_limit_tensor is not None and upper_limit_tensor is not None):
+        # Use the largest ρ for grid sizing (rho is only used for docstring in compute_projected_levelset)
+        max_rho = max(rho_final, max((r for r, *_ in (extra_rho_levels or []) if r > 0), default=0))
         for (pi, pj) in pairs:
             proj_grids[(pi, pj)] = compute_projected_levelset(
-                lyapunov_final, rho_final, pi, pj,
+                lyapunov_final, max_rho, pi, pj,
                 lower_limit_tensor, upper_limit_tensor,
                 grid_size=proj_grid_size,
                 n_opt_steps=proj_opt_steps,
@@ -908,6 +1041,20 @@ def plot_ellipsoid_projections(
                 if idx == 0:
                     print(f"[warn] projection contour failed: {e}")
 
+        # ── Extra V(x)=ρ contour levels (e.g. PGD vs CROWN comparison) ──
+        if extra_rho_levels and (i, j) in proj_grids:
+            xi_vals, xj_vals, V_proj = proj_grids[(i, j)]
+            for (extra_rho, color, ls, label_str) in extra_rho_levels:
+                if extra_rho > 0:
+                    try:
+                        ax.contour(xi_vals, xj_vals, V_proj, levels=[extra_rho],
+                                   colors=[color], linewidths=[2], linestyles=[ls], zorder=9)
+                        if idx == 0:
+                            ax.plot([], [], color=color, linewidth=2, linestyle=ls,
+                                    label=label_str)
+                    except Exception:
+                        pass
+
         ax.axhline(0, color='white', linewidth=0.4, alpha=0.4)
         ax.axvline(0, color='white', linewidth=0.4, alpha=0.4)
         ax.set_xlabel(state_labels[i], fontsize=11)
@@ -927,161 +1074,127 @@ def plot_ellipsoid_projections(
     return fig
 
 
-def plot_V_heatmap_with_trajectories(
-    lyapunov_nn,
+def plot_flow_field(
+    dynamics: nn.Module,
+    controller: nn.Module,
+    lyapunov_nn: nn.Module,
     rho: float,
     lower_limit: torch.Tensor,
     upper_limit: torch.Tensor,
-    trajectories: torch.Tensor,
-    title: str = "Lyapunov V Heatmap",
+    state_labels: list,
+    trajectories: torch.Tensor = None,
+    title: str = "Closed-Loop Flow Field",
+    grid_density: int = 25,
 ) -> plt.Figure:
-    """Plot V heatmap for 2-D plant state (x1, x2) with trajectory overlays.
+    """Plot quiver (vector field) of the closed-loop dynamics with V contours.
 
-    Other dimensions are sliced at 0.  This is the 'old-style' 2-D heatmap —
-    kept alongside the projection plots to show the Lyapunov landscape.
-    """
-    lo0, lo1 = lower_limit[0].item(), lower_limit[1].item()
-    hi0, hi1 = upper_limit[0].item(), upper_limit[1].item()
-    n_grid = 400
-    t0 = torch.linspace(lo0, hi0, n_grid, device=device)
-    t1 = torch.linspace(lo1, hi1, n_grid, device=device)
-    g0, g1 = torch.meshgrid(t0, t1, indexing='ij')
-    nx = lyapunov_nn.x_dim
-    if nx > 2:
-        pad = torch.zeros(*g0.shape, nx - 2, device=device)
-        pts = torch.cat([torch.stack((g0, g1), dim=2), pad], dim=2)
-    else:
-        pts = torch.stack((g0, g1), dim=2)
-    with torch.no_grad():
-        V_vals = lyapunov_nn(pts).squeeze(-1).cpu().numpy()
-
-    fig, ax = plt.subplots(1, 1, figsize=(8, 7))
-    ax.set_facecolor('#1a1a2e')
-    im = ax.pcolormesh(g0.cpu().numpy(), g1.cpu().numpy(), V_vals,
-                       shading='auto', cmap='viridis')
-    fig.colorbar(im, ax=ax, label='V(x)')
-
-    # ROA contour
-    legend_handles = []
-    cs = ax.contour(g0.cpu().numpy(), g1.cpu().numpy(), V_vals, [rho],
-                    colors='red', linewidths=2)
-    if any(len(s) > 0 for s in cs.allsegs[0]):
-        legend_handles.append(
-            plt.Line2D([0], [0], color='red', linewidth=2,
-                       label=f'ROA (ρ={rho:.4f})'))
-
-    # Trajectories
-    if trajectories is not None:
-        traj_np = (trajectories.cpu().numpy() if isinstance(trajectories, torch.Tensor)
-                  else trajectories)  # (T, N, nx)
-        n_traj = traj_np.shape[1]
-        colors = plt.cm.cool(np.linspace(0, 1, n_traj))
-        for k in range(n_traj):
-            ax.plot(traj_np[:, k, 0], traj_np[:, k, 1],
-                    color=colors[k], alpha=0.5, linewidth=0.9)
-            ax.plot(traj_np[0, k, 0], traj_np[0, k, 1],
-                    'o', color=colors[k], markersize=4, alpha=0.8)
-
-    if legend_handles:
-        ax.legend(handles=legend_handles, fontsize=9)
-    slice_note = "" if nx <= 2 else f" (x₃=x₄=0 slice, {nx}D state)"
-    ax.set_title(title + slice_note, fontsize=12)
-    ax.set_xlabel(r"$x_1$  (θ, rad)", fontsize=11)
-    ax.set_ylabel(r"$x_2$  (θ̇, rad/s)", fontsize=11)
-    ax.grid(True, alpha=0.25)
-    fig.tight_layout()
-    return fig
-
-
-def plot_roa_comparison(
-    V_init_fn,
-    rho_init,
-    V_final_fn,
-    rho_final,
-    lower_limit,
-    upper_limit,
-    nx,
-    logger=None,
-):
-    """Plot initial vs trained ROA comparison (x1-x2 slice heatmap).
+    For 2-D systems, plots a single panel. For higher-dim systems, plots all
+    C(n_plant, 2) pairwise projections (other states held at 0) in a grid.
 
     Args:
-        V_init_fn: Callable(x) -> V values for the initial model.
-        rho_init: Verified rho before training.
-        V_final_fn: Callable(x) -> V values for the trained model.
-        rho_final: Verified rho after training.
-        lower_limit, upper_limit: Box limits (full augmented dim).
-        nx: State dimension.
-        logger: Optional logger.
-
+        dynamics: Discrete-time dynamics f(x, u).
+        controller: Controller u(x).
+        lyapunov_nn: Lyapunov network V(x).
+        rho: Verified ρ (ROA level).
+        lower_limit, upper_limit: Domain bounds (nx,).
+        state_labels: List of state label strings.
+        trajectories: Optional (T+1, N, nx) tensor of closed-loop trajectories.
+        title: Figure title.
+        grid_density: Number of grid points per axis for quiver.
     Returns:
         matplotlib Figure.
     """
-    fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+    import itertools
 
-    # Use first two state dimensions for the grid
-    lo0, lo1 = lower_limit[0].item(), lower_limit[1].item()
-    hi0, hi1 = upper_limit[0].item(), upper_limit[1].item()
+    nx = lyapunov_nn.x_dim
+    n_plant = 2  # assume first 2 are plant states for projection
+    device = next(lyapunov_nn.parameters()).device
+    lo = lower_limit.cpu().numpy()
+    hi = upper_limit.cpu().numpy()
 
-    n_grid = 500
-    ticks_0 = torch.linspace(lo0, hi0, n_grid, device=device)
-    ticks_1 = torch.linspace(lo1, hi1, n_grid, device=device)
-    grid_0, grid_1 = torch.meshgrid(ticks_0, ticks_1, indexing='ij')
+    pairs = list(itertools.combinations(range(min(nx, 4)), 2))
+    n_pairs = len(pairs)
+    ncols = min(3, n_pairs)
+    nrows = int(np.ceil(n_pairs / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5.5 * nrows))
+    axes_flat = np.array(axes).flatten() if n_pairs > 1 else [axes]
 
-    if nx <= 2:
-        pts = torch.stack((grid_0, grid_1), dim=2)
-    else:
-        # Pad remaining dims with zeros (slice at x_k = 0)
-        pad = torch.zeros(*grid_0.shape, nx - 2, device=device)
-        pts = torch.cat([torch.stack((grid_0, grid_1), dim=2), pad], dim=2)
+    traj_np = (trajectories.cpu().numpy() if isinstance(trajectories, torch.Tensor)
+               else trajectories) if trajectories is not None else None
 
-    with torch.no_grad():
-        V_init_vals = V_init_fn(pts).squeeze(-1)
-        V_final_vals = V_final_fn(pts).squeeze(-1)
+    for idx, (di, dj) in enumerate(pairs):
+        ax = axes_flat[idx]
 
-    g0 = grid_0.cpu().numpy()
-    g1 = grid_1.cpu().numpy()
+        # Build 2D grid for this projection
+        xi = np.linspace(lo[di], hi[di], grid_density)
+        xj = np.linspace(lo[dj], hi[dj], grid_density)
+        XI, XJ = np.meshgrid(xi, xj)
+        flat_i = XI.ravel()
+        flat_j = XJ.ravel()
+        n_pts = len(flat_i)
 
-    # Heatmap of final V
-    im = ax.pcolormesh(g0, g1, V_final_vals.cpu().numpy(), shading='auto', cmap='viridis')
-    fig.colorbar(im, ax=ax, label='V (trained)')
+        # Full state: zero except dims di, dj
+        x_np = np.zeros((n_pts, nx), dtype=np.float32)
+        x_np[:, di] = flat_i
+        x_np[:, dj] = flat_j
+        x_t = torch.tensor(x_np, device=device)
 
-    # Build legend with proxy Line2D artists to avoid deprecated .collections API
-    # and to handle empty contours (contour level outside plot domain) gracefully.
-    legend_handles = []
+        with torch.no_grad():
+            u_t = controller(x_t)
+            x_next = dynamics.forward(x_t, u_t)
+            dx = (x_next - x_t).cpu().numpy()
+            V_vals = lyapunov_nn(x_t).squeeze(-1).cpu().numpy()
 
-    # Initial ROA contour
-    if rho_init > 0:
-        cs_init = ax.contour(
-            g0, g1, V_init_vals.cpu().numpy(), [rho_init],
-            colors='cyan', linewidths=2, linestyles='--',
-        )
-        # allsegs[0] is the list of path arrays for the first (only) level
-        if any(len(seg) > 0 for seg in cs_init.allsegs[0]):
-            legend_handles.append(
-                plt.Line2D([0], [0], color='cyan', linewidth=2, linestyle='--',
-                           label=f'Initial ROA ($\\rho_0$={rho_init:.4f})')
-            )
+        DI = dx[:, di].reshape(XI.shape)
+        DJ = dx[:, dj].reshape(XI.shape)
+        V_grid = V_vals.reshape(XI.shape)
 
-    # Final ROA contour
-    if rho_final > 0:
-        cs_final = ax.contour(
-            g0, g1, V_final_vals.cpu().numpy(), [rho_final],
-            colors='red', linewidths=2, linestyles='-',
-        )
-        if any(len(seg) > 0 for seg in cs_final.allsegs[0]):
-            legend_handles.append(
-                plt.Line2D([0], [0], color='red', linewidth=2, linestyle='-',
-                           label=f'Trained ROA ($\\rho$={rho_final:.4f})')
-            )
+        # Magnitude for color
+        mag = np.sqrt(DI**2 + DJ**2)
+        mag_norm = mag / (mag.max() + 1e-12)
 
-    if legend_handles:
-        ax.legend(handles=legend_handles, loc='upper right', fontsize=10)
-    slice_note = "" if nx <= 2 else f" (slice at $x_{{k}}=0$, {nx}D state)"
-    ax.set_title(f"ROA Comparison: Initial vs Trained{slice_note}")
-    ax.set_xlabel(r"$x_1$")
-    ax.set_ylabel(r"$x_2$")
-    ax.grid(True, alpha=0.3)
+        # Background: V heatmap
+        im = ax.pcolormesh(XI, XJ, V_grid, cmap='Blues', alpha=0.35, shading='auto', zorder=0)
+
+        # Quiver (vector field)
+        ax.quiver(XI, XJ, DI, DJ, mag_norm,
+                  cmap='coolwarm', scale=None, alpha=0.75,
+                  width=0.003, headwidth=3.5, zorder=3)
+
+        # V = rho contour (ROA boundary)
+        if rho > 0:
+            ax.contour(XI, XJ, V_grid, levels=[rho],
+                       colors=['orange'], linewidths=2.5, zorder=5)
+            # Additional contours at fractions of rho
+            sub_levels = [rho * f for f in [0.25, 0.5, 0.75]]
+            ax.contour(XI, XJ, V_grid, levels=sub_levels,
+                       colors=['gray'], linewidths=0.8, linestyles='dotted', alpha=0.6, zorder=4)
+
+        # Trajectories
+        if traj_np is not None:
+            n_traj = traj_np.shape[1]
+            for k in range(n_traj):
+                ax.plot(traj_np[:, k, di], traj_np[:, k, dj],
+                        color='lime', alpha=0.3, linewidth=0.6, zorder=6)
+                ax.plot(traj_np[0, k, di], traj_np[0, k, dj],
+                        'o', color='lime', markersize=2, alpha=0.5, zorder=7)
+
+        ax.plot(0, 0, '+', color='white', markersize=10, markeredgewidth=2, zorder=10)
+        ax.set_xlabel(state_labels[di], fontsize=11)
+        ax.set_ylabel(state_labels[dj], fontsize=11)
+        ax.set_facecolor('#0d1117')
+        ax.grid(True, alpha=0.15, color='gray')
+        ax.set_xlim(lo[di], hi[di])
+        ax.set_ylim(lo[dj], hi[dj])
+        ax.set_aspect('equal', adjustable='datalim')
+        if idx == 0 and rho > 0:
+            ax.plot([], [], color='orange', linewidth=2.5, label=f'V(x)=ρ={rho:.4f}')
+            ax.legend(fontsize=8, loc='upper right')
+
+    for idx in range(n_pairs, len(axes_flat)):
+        axes_flat[idx].set_visible(False)
+
+    fig.suptitle(title, fontsize=13, fontweight='bold')
     fig.tight_layout()
     return fig
 
@@ -1091,6 +1204,78 @@ def _np(t):
     if t is None:
         return None
     return t.detach().cpu().float().numpy() if isinstance(t, torch.Tensor) else np.asarray(t, dtype=float)
+
+
+def run_crown_verification(
+    cfg, formal_cfg, derivative_lyaloss, init_rho, logger,
+    label="", verify_subdir="formal_verification",
+    model_pth_override=None, pure_quadratic=False,
+):
+    """Run α,β-CROWN formal verification with bisection.
+
+    Args:
+        cfg: Full Hydra config.
+        formal_cfg: cfg.formal_verification sub-config.
+        derivative_lyaloss: Loss module (provides s_scale and state_dict).
+        init_rho: Starting ρ for bisection.
+        label: Human-readable label for logging.
+        verify_subdir: Subdirectory name for results.
+        model_pth_override: Path to checkpoint (if not default).
+        pure_quadratic: Disable Lyapunov NN for faster verification.
+
+    Returns:
+        Verified ρ (0.0 on failure).
+    """
+    try:
+        from neural_lyapunov_training.verify_dissipativity import run_verification
+    except ImportError:
+        logger.warning("α,β-CROWN not available. Skipping formal verification.")
+        return 0.0
+
+    logger.info("=" * 60)
+    logger.info(f"FORMAL VERIFICATION (α,β-CROWN) — {label}")
+    logger.info("=" * 60)
+
+    try:
+        training_cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+        result = run_verification(
+            training_dir=os.getcwd(),
+            init_rho=init_rho,
+            training_cfg=training_cfg_dict,
+            logger=logger,
+            timeout=formal_cfg.get("timeout", 200),
+            rho_eps=formal_cfg.get("rho_eps", 0.001),
+            rho_multiplier=formal_cfg.get("rho_multiplier", 1.2),
+            max_bisect_iters=formal_cfg.get("max_bisect_iters", 30),
+            hole_size=formal_cfg.get("hole_size", 0.001),
+            model_pth_override=model_pth_override,
+            verify_subdir=verify_subdir,
+            device=formal_cfg.get("device", "auto"),
+            batch_size=formal_cfg.get("batch_size", None),
+            effective_s_scale=derivative_lyaloss.get_s_scale_value(),
+            pure_quadratic=pure_quadratic,
+            smart_bracket=formal_cfg.get("smart_bracket", False),
+            bracket_shift=formal_cfg.get("bracket_shift", None),
+            pgd_restarts=formal_cfg.get("pgd_restarts", 10000),
+            domain_tightening=formal_cfg.get("domain_tightening", True),
+            tightening_samples=formal_cfg.get("tightening_samples", 500000),
+            tightening_margin=formal_cfg.get("tightening_margin", 1.05),
+        )
+
+        if result["success"]:
+            verified_rho = result["verified_rho"]
+            logger.info(f"  CROWN-verified rho: {verified_rho:.6f}")
+            return verified_rho
+        else:
+            logger.warning(f"  CROWN verification did not succeed ({label}).")
+            return 0.0
+    except Exception as e:
+        logger.error(f"Formal verification failed ({label}): {e}")
+        import traceback
+        traceback.print_exc()
+        return 0.0
+    finally:
+        logger.info("=" * 60)
 
 
 def log_parameter_tables(
@@ -1270,10 +1455,15 @@ def log_parameter_tables(
     logger.info(line)
     logger.info("LYAPUNOV PARAMETERS")
     logger.info(line)
-    logger.info(
-        "  V(x) = ε‖x‖² + x\u1d40 (R_frozen\u1d40 R_frozen "
-        "+ R_trainable\u1d40 R_trainable) x"
-    )
+    if lyapunov_nn._is_pure_nn:
+        logger.info(f"  Pure-NN Lyapunov: V_psd_form={lyapunov_nn.V_psd_form}")
+        logger.info(f"  nn_scale={lyapunov_nn.get_nn_scale_value():.4f}"
+                     f"{' (learnable)' if lyapunov_nn._learnable_nn_scale else ''}")
+    else:
+        logger.info(
+            "  V(x) = ε‖x‖² + x\u1d40 (R_frozen\u1d40 R_frozen "
+            "+ R_trainable\u1d40 R_trainable) x"
+        )
 
     with torch.no_grad():
         eps         = float(lyapunov_nn.eps) if hasattr(lyapunov_nn, "eps") else 0.0
@@ -1314,7 +1504,14 @@ def log_parameter_tables(
 
 @hydra.main(config_path="./config", config_name="pendulum_state_training")
 def main(cfg: DictConfig):
+    global device
     OmegaConf.save(cfg, os.path.join(os.getcwd(), "config.yaml"))
+
+    # Allow config to override training device (default: cpu)
+    _train_device = cfg.get("train", {}).get("device", "cpu") if hasattr(cfg, "train") else "cpu"
+    if _train_device == "auto":
+        _train_device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(_train_device)
 
     train_utils.set_seed(cfg.seed)
 
@@ -1363,6 +1560,16 @@ def main(cfg: DictConfig):
     use_frozen_lya = lya_cfg.get('use_frozen_quadratic', True) if (manual_P or use_crown_sdp_init) else False
     use_trainable_lya = lya_cfg.get('use_trainable_quadratic', False)
     use_nonlinear_lya = lya_cfg.get('use_nonlinear', True)
+
+    # Pure-NN Lyapunov forms don't use R matrices at all
+    v_psd_form = cfg.model.V_psd_form
+    _is_pure_nn = v_psd_form in lyapunov.NeuralNetworkLyapunov._PURE_NN_FORMS
+    if _is_pure_nn:
+        use_frozen_lya = False
+        use_trainable_lya = False
+        use_nonlinear_lya = True  # NN is the only Lyapunov component
+        logger.info(f"Pure-NN Lyapunov mode ({v_psd_form}): "
+                     "R matrices disabled, NN provides all structure")
 
     # --- INITIAL SOLVES / READS ---
     K_init_base = None
@@ -1470,15 +1677,56 @@ def main(cfg: DictConfig):
     elif controller_type == 'rinn':
         # ---- Recurrent Implicit Neural Network Controller ----
         rinn_cfg = con_cfg.get('rinn', {})
-        A_r   = torch.tensor(rinn_cfg['A'],   dtype=dtype, device=device)
-        Bw_r  = torch.tensor(rinn_cfg['Bw'],  dtype=dtype, device=device)
-        By_r  = torch.tensor(rinn_cfg['By'],  dtype=dtype, device=device)
-        Cv_r  = torch.tensor(rinn_cfg['Cv'],  dtype=dtype, device=device)
-        Dvw_r = torch.tensor(rinn_cfg['Dvw'], dtype=dtype, device=device)
-        Dvy_r = torch.tensor(rinn_cfg['Dvy'], dtype=dtype, device=device)
-        Cu_r  = torch.tensor(rinn_cfg['Cu'],  dtype=dtype, device=device)
-        Duw_r = torch.tensor(rinn_cfg['Duw'], dtype=dtype, device=device)
-        Duy_r = torch.tensor(rinn_cfg['Duy'], dtype=dtype, device=device)
+
+        # Load matrices from a .pth file or from inline YAML values.
+        rinn_weights_path = rinn_cfg.get('weights_path', None)
+        if rinn_weights_path is not None:
+            # --- Load from .pth state_dict (keys stored transposed: X_T) ---
+            rinn_weights_path = os.path.expanduser(rinn_weights_path)
+            if not os.path.isabs(rinn_weights_path):
+                rinn_weights_path = os.path.join(hydra.utils.get_original_cwd(), rinn_weights_path)
+            logger.info(f"Loading RINN matrices from: {rinn_weights_path}")
+            wd = torch.load(rinn_weights_path, map_location=device, weights_only=False)
+            A_r   = wd['A_T'].t().contiguous().to(dtype)
+            Bw_r  = wd['Bw_T'].t().contiguous().to(dtype)
+            By_r  = wd['By_T'].t().contiguous().to(dtype)
+            Cv_r  = wd['Cv_T'].t().contiguous().to(dtype)
+            Dvw_r = wd['Dvw_T'].t().contiguous().to(dtype)
+            Dvy_r = wd['Dvy_T'].t().contiguous().to(dtype)
+            Cu_r  = wd['Cu_T'].t().contiguous().to(dtype)
+            Duw_r = wd['Duw_T'].t().contiguous().to(dtype)
+            Duy_r = wd['Duy_T'].t().contiguous().to(dtype)
+            logger.info(f"  A_r =\n{A_r.detach().cpu()}")
+            logger.info(f"  Bw_r =\n{Bw_r.detach().cpu()}")
+            logger.info(f"  By_r =\n{By_r.detach().cpu()}")
+            logger.info(f"  Cv_r =\n{Cv_r.detach().cpu()}")
+            logger.info(f"  Dvw_r =\n{Dvw_r.detach().cpu()}")
+            logger.info(f"  Dvy_r =\n{Dvy_r.detach().cpu()}")
+            logger.info(f"  Cu_r =\n{Cu_r.detach().cpu()}")
+            logger.info(f"  Duw_r =\n{Duw_r.detach().cpu()}")
+            logger.info(f"  Duy_r =\n{Duy_r.detach().cpu()}")
+            # Optionally override P_init from the same file
+            if 'P' in wd and manual_P is None:
+                P_from_pth = wd['P'].to(dtype).to(device)
+                if isinstance(P_from_pth, torch.Tensor) and P_from_pth.ndim == 2:
+                    P_init_base = P_from_pth
+                    logger.info(f"  P_init loaded from .pth: shape={P_init_base.shape}")
+                    logger.info(f"  P_init raw from .pth =\n{P_init_base.detach().cpu()}")
+            logger.info(
+                f"  RINN matrices loaded: n_k={A_r.shape[0]}, n_w={Bw_r.shape[1]}"
+            )
+        else:
+            # --- Inline matrices from YAML ---
+            A_r   = torch.tensor(rinn_cfg['A'],   dtype=dtype, device=device)
+            Bw_r  = torch.tensor(rinn_cfg['Bw'],  dtype=dtype, device=device)
+            By_r  = torch.tensor(rinn_cfg['By'],  dtype=dtype, device=device)
+            Cv_r  = torch.tensor(rinn_cfg['Cv'],  dtype=dtype, device=device)
+            Dvw_r = torch.tensor(rinn_cfg['Dvw'], dtype=dtype, device=device)
+            Dvy_r = torch.tensor(rinn_cfg['Dvy'], dtype=dtype, device=device)
+            Cu_r  = torch.tensor(rinn_cfg['Cu'],  dtype=dtype, device=device)
+            Duw_r = torch.tensor(rinn_cfg['Duw'], dtype=dtype, device=device)
+            Duy_r = torch.tensor(rinn_cfg['Duy'], dtype=dtype, device=device)
+
         n_k = A_r.shape[0]
         rinn_trainable = rinn_cfg.get('trainable', False)
         rinn_activation = rinn_cfg.get('activation', 'relu')
@@ -1505,6 +1753,15 @@ def main(cfg: DictConfig):
             f"activation={rinn_activation}, trainable={rinn_trainable}, "
             f"augmented state dim={dynamics.nx}"
         )
+        logger.info(f"  controller.A_kd =\n{controller.A_kd.detach().cpu()}")
+        logger.info(f"  controller.Bw_kd =\n{controller.Bw_kd.detach().cpu()}")
+        logger.info(f"  controller.By_kd =\n{controller.By_kd.detach().cpu()}")
+        logger.info(f"  controller.Cv =\n{controller.Cv.detach().cpu()}")
+        logger.info(f"  controller.Dvw =\n{controller.Dvw.detach().cpu()}")
+        logger.info(f"  controller.Dvy =\n{controller.Dvy.detach().cpu()}")
+        logger.info(f"  controller.Cu =\n{controller.Cu.detach().cpu()}")
+        logger.info(f"  controller.Duw =\n{controller.Duw.detach().cpu()}")
+        logger.info(f"  controller.Duy =\n{controller.Duy.detach().cpu()}")
     else:
         # ---- Default: Linear + NN Controller ----
         controller = controllers.LinearPlusNeuralNetworkController(
@@ -1620,28 +1877,54 @@ def main(cfg: DictConfig):
     # Always keep a tiny positive eps floor so R_trainable cannot collapse to zero
     # during optimisation
     _eps_floor = 1e-6
-    lya_eps = max(float(lya_eps_from_P), _eps_floor) if P_val is not None else 0.01
+    if _is_pure_nn:
+        lya_eps = 0.0  # pure-NN forms don't use eps·‖x‖² base
+    else:
+        lya_eps = max(float(lya_eps_from_P), _eps_floor) if P_val is not None else 0.01
 
     # For any quadratic_times_* mode, honour the user's use_nonlinear flag.
     # quadratic_times_<fn> + use_nonlinear=False → pure quadratic (no NN in graph).
     # quadratic_times_<fn> + use_nonlinear=True  → V = x'Px · multiplier(NN(x)).
     #   tanh: multiplier = 1 + α·tanh(NN),  α = nn_scale ∈ (0,1)
     #   exp:  multiplier = exp(NN),           always > 0, no α constraint needed
+    # quadratic_plus_sq: V = x'Px + α·(NN(x)−NN(0))²  — CROWN-friendly additive form.
     v_psd_form = cfg.model.V_psd_form
     nn_scale = lya_cfg.get('nn_scale', 0.5)
     if v_psd_form.startswith("quadratic_times_"):
         suffix = v_psd_form[len("quadratic_times_"):]
         if use_nonlinear_lya:
-            lya_activation = nn.Tanh
+            # Hidden-layer activation comes from config (leaky_relu/relu preferred for
+            # CROWN compatibility — tighter piecewise-linear bounds). The outer tanh
+            # multiplier in V_psd_form already provides the nonlinear structure.
             logger.info(
                 f"quadratic_times_{suffix} mode: NN enabled (use_nonlinear=True), "
-                f"tanh activation, nn_scale={nn_scale}, zero-init last layer"
+                f"hidden activation={lya_activation_name}, nn_scale={nn_scale}, zero-init last layer"
             )
         else:
             logger.info(
                 f"quadratic_times_{suffix} mode: NN disabled (use_nonlinear=False) "
                 f"→ pure trainable quadratic"
             )
+    elif v_psd_form == "quadratic_plus_sq":
+        logger.info(
+            f"quadratic_plus_sq mode: V = x'Px + {nn_scale}·(NN(x)−NN(0))², "
+            f"hidden activation={lya_activation_name} (smooth+CROWN-friendly), "
+            f"zero-init last layer"
+        )
+    elif v_psd_form == "quadratic_plus_abs":
+        logger.info(
+            f"quadratic_plus_abs mode: V = x'Px + {nn_scale}·|NN(x)−NN(0)|, "
+            f"hidden activation={lya_activation_name}, "
+            f"zero-init last layer"
+        )
+    elif _is_pure_nn:
+        logger.info(
+            f"Pure-NN mode ({v_psd_form}): V defined entirely by NN, "
+            f"no quadratic base, nn_scale={nn_scale}, "
+            f"hidden activation={lya_activation_name}"
+        )
+
+    learnable_nn_scale = lya_cfg.get('learnable_nn_scale', False)
 
     lyapunov_nn = lyapunov.NeuralNetworkLyapunov(
         goal_state=dynamics.x_equilibrium.to(dtype).to(device),
@@ -1655,10 +1938,13 @@ def main(cfg: DictConfig):
         V_psd_form=v_psd_form,
         use_nonlinear=use_nonlinear_lya,
         nn_scale=nn_scale,
+        learnable_nn_scale=learnable_nn_scale,
     )
     lyapunov_nn.to(device)
     lyapunov_nn.eval()
     logger.info(f"Lyapunov instantiated: Frozen={use_frozen_lya}, Trainable={use_trainable_lya}, NN={use_nonlinear_lya}")
+    if learnable_nn_scale:
+        logger.info(f"  nn_scale is LEARNABLE, initial value={nn_scale}")
 
     # Logging parameter summary
     trainable_params = sum(p.numel() for p in list(controller.parameters()) + list(lyapunov_nn.parameters()) if p.requires_grad)
@@ -1676,8 +1962,12 @@ def main(cfg: DictConfig):
     
     # Unified dissipativity framework (backward compatible with pure Lyapunov)
     # Note: This initial derivative_lyaloss is just a placeholder and will be recreated in the training loop
+    if P_val is not None:
+        logger.info(f"  P_val before normalization =\n{P_val.detach().cpu()}")
     # Handle ListConfig from OmegaConf
     rho_mult_init = rho_multiplier[0] if hasattr(rho_multiplier, '__getitem__') and not isinstance(rho_multiplier, (int, float)) else rho_multiplier
+    if P_val is not None:
+        logger.info(f"  P_val after normalization =\n{P_val.detach().cpu()}")
     # Supply-rate scaling: V is built from P/\u2016P\u2016_F, so the dissipation
     # inequality must be scaled by 1/\u2016P\u2016_F to stay dimensionally consistent.
     # When s_scale is left at its default (1.0) and P was normalised, auto-set it.
@@ -1687,6 +1977,14 @@ def main(cfg: DictConfig):
         logger.info(f"Auto s_scale = 1/\u2016P\u2016_F = {s_scale:.6e}  (P was normalised)")
     elif s_scale != 1.0:
         logger.info(f"Using supply rate scaling s_scale = {s_scale}")
+
+    learnable_s_scale = cfg.loss.get('learnable_s_scale', False)
+    if learnable_s_scale:
+        logger.info(f"s_scale is LEARNABLE (log-parameterized, init={s_scale:.4e}); "
+                    f"will be optimized jointly with V and controller at lr*0.1")
+
+    c1_threshold = cfg.loss.get('c1_threshold', 0.0)
+    c1_multiplier = cfg.loss.get('c1_multiplier', 0.0)
 
     derivative_lyaloss = lyapunov.DissipativityDerivativeLoss(
         dynamics,
@@ -1699,6 +1997,9 @@ def main(cfg: DictConfig):
         w_max=w_max,
         hard_max=cfg.train.hard_max,
         s_scale=s_scale,
+        learnable_s_scale=learnable_s_scale,
+        c1_threshold=c1_threshold,
+        c1_multiplier=c1_multiplier,
     )
 
     dynamics.to(device)
@@ -1757,6 +2058,49 @@ def main(cfg: DictConfig):
         state_labels = [r"$\theta$ (rad)", r"$\dot{\theta}$ (rad/s)"][:nx]
 
     # =====================================================================
+    # Quadratic imitation pre-training for pure-NN Lyapunov forms
+    # =====================================================================
+    if _is_pure_nn and P_init_base is not None:
+        logger.info("="*60)
+        logger.info(f"QUADRATIC IMITATION PRE-TRAINING ({v_psd_form})")
+        logger.info("="*60)
+        # Use unnormalized P_init, embedded to full state dim if needed
+        P_imitation = P_init_base.clone().to(device)
+        if P_imitation.shape[0] < nx:
+            P_aug = torch.zeros(nx, nx, dtype=P_imitation.dtype, device=device)
+            np_ = P_imitation.shape[0]
+            P_aug[:np_, :np_] = P_imitation
+            # Small identity for controller states
+            P_aug[np_:, np_:] = P_imitation.diagonal().mean() * torch.eye(
+                nx - np_, dtype=P_imitation.dtype, device=device)
+            P_imitation = P_aug
+        pretrain_quadratic_imitation(
+            lyapunov_nn, P_imitation,
+            lower_limit=-model_limit, upper_limit=model_limit,
+            V_psd_form=v_psd_form,
+            n_samples=cfg.get('imitation_n_samples', 10000),
+            n_steps=cfg.get('imitation_n_steps', 100000),
+            lr=cfg.get('imitation_lr', 3e-4),
+            logger=logger,
+        )
+
+        # For c₁-exclusion forms (nn_sigmoid_c1, nn_sigmoid_abs):
+        # imitation only teaches V shape, not decrease.  Pre-train decrease
+        # so that init verified ρ >> V(x*), enabling non-vacuous c₁.
+        if v_psd_form in ("nn_sigmoid_c1", "nn_sigmoid_abs") and c1_multiplier > 0:
+            logger.info("DECREASE PRE-TRAINING (c₁-exclusion form)")
+            pretrain_decrease(
+                lyapunov_nn, dynamics, controller,
+                lower_limit=-model_limit, upper_limit=model_limit,
+                kappa=supply_rate.kappa if hasattr(supply_rate, 'kappa') else 0.001,
+                c1_frac=c1_multiplier,
+                n_steps=cfg.get('decrease_pretrain_steps', 3000),
+                n_samples=cfg.get('decrease_pretrain_samples', 50000),
+                lr=cfg.get('decrease_pretrain_lr', 5e-4),
+                logger=logger,
+            )
+
+    # =====================================================================
     # Pre-training verification: find largest verified rho with initial model
     # =====================================================================
     verify_init = cfg.get('verify_init', False)
@@ -1774,7 +2118,7 @@ def main(cfg: DictConfig):
 
         init_rho, init_max_rho, init_clean = pgd_find_verified_rho(
             lyapunov_nn, dynamics, controller, supply_rate,
-            init_lower, init_upper, w_max, s_scale,
+            init_lower, init_upper, w_max, derivative_lyaloss.get_s_scale_value(),
             V_decrease_within_roa=V_decrease_within_roa,
             pgd_steps=cfg.get('pgd_verifier_steps', 300),
             num_seeds=cfg.get('pgd_verifier_num_seeds', 5),
@@ -1783,6 +2127,7 @@ def main(cfg: DictConfig):
             rho_bisect_tol=cfg.get('verify_init_rho_tol', 0.005),
             max_bisect_iters=cfg.get('verify_init_max_bisect', 20),
             logger=logger,
+            c1_threshold=c1_threshold, c1_multiplier=c1_multiplier,
         )
 
         logger.info(f"Initial verified rho: {init_rho:.6f}  (max_rho={init_max_rho:.6f})")
@@ -1802,7 +2147,7 @@ def main(cfg: DictConfig):
                 dynamics=dynamics,
                 controller=controller,
                 supply_rate_fn=supply_rate,
-                s_scale=s_scale,
+                s_scale=derivative_lyaloss.get_s_scale_value(),
                 rho=init_rho,
                 nx=nx,
                 logger=logger,
@@ -1851,14 +2196,10 @@ def main(cfg: DictConfig):
             logger.info(f"Initial ROA plot saved: {init_plot_path}")
 
             # Ellipsoid projections for initial model
-            with torch.no_grad():
-                P_init_eff_pre = lyapunov_nn.eps * torch.eye(nx, device=device)
-                if hasattr(lyapunov_nn, 'R_frozen') and lyapunov_nn.R_frozen is not None:
-                    P_init_eff_pre = P_init_eff_pre + lyapunov_nn.R_frozen.T @ lyapunov_nn.R_frozen
-                if hasattr(lyapunov_nn, 'R_trainable') and lyapunov_nn.R_trainable is not None:
-                    P_init_eff_pre = P_init_eff_pre + lyapunov_nn.R_trainable.T @ lyapunov_nn.R_trainable
+            P_init_eff_pre = get_effective_P(lyapunov_nn, device=device)
+            P_init_pre_np = P_init_eff_pre.cpu().numpy() if P_init_eff_pre is not None else None
             fig_proj_pre = plot_ellipsoid_projections(
-                P_init=P_init_eff_pre.cpu().numpy(),
+                P_init=P_init_pre_np,
                 rho_init=init_rho,
                 P_final=None,
                 rho_final=0.0,
@@ -1879,6 +2220,47 @@ def main(cfg: DictConfig):
 
         logger.info("="*60)
 
+    # =====================================================================
+    # Initial Formal Verification (α,β-CROWN) — before training
+    # =====================================================================
+    init_crown_rho = 0.0
+    formal_cfg = cfg.get("formal_verification", {})
+    formal_verification_enabled = formal_cfg.get("enabled", False) if formal_cfg else False
+    verify_initial_crown = formal_cfg.get("verify_initial", False) if formal_cfg else False
+    verify_final_crown = formal_cfg.get("verify_final", False) if formal_cfg else False
+
+    if verify_init and formal_verification_enabled and verify_initial_crown and init_rho > 0:
+        # Save RNG state so CROWN verification doesn't perturb training
+        _rng_state_torch = torch.random.get_rng_state()
+        _rng_state_cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        _rng_state_np = np.random.get_state()
+        _rng_state_py = random.getstate()
+
+        # Save initial checkpoint for CROWN
+        init_pth_path = os.path.join(os.getcwd(), "lyaloss_init.pth")
+        torch.save(
+            {"state_dict": derivative_lyaloss.state_dict(),
+             "rho": derivative_lyaloss.get_rho() if derivative_lyaloss.x_boundary is not None else 0.0,
+             "s_scale": derivative_lyaloss.get_s_scale_value()},
+            init_pth_path,
+        )
+        init_crown_rho = run_crown_verification(
+            cfg, formal_cfg, derivative_lyaloss, init_rho, logger,
+            label="initial (pre-training)",
+            verify_subdir="formal_verification_init",
+            model_pth_override=init_pth_path,
+            pure_quadratic=formal_cfg.get("init_pure_quadratic", False),
+        )
+        if cfg.train.wandb.enabled and init_crown_rho > 0:
+            wandb.run.summary["init_crown_rho"] = init_crown_rho
+
+        # Restore RNG state so training is deterministic regardless of CROWN
+        torch.random.set_rng_state(_rng_state_torch)
+        if _rng_state_cuda is not None:
+            torch.cuda.set_rng_state_all(_rng_state_cuda)
+        np.random.set_state(_rng_state_np)
+        random.setstate(_rng_state_py)
+
     if cfg.train.train_lyaloss:
         for n in range(len(cfg.model.limit_scale)):
             limit_scale = cfg.model.limit_scale[n]
@@ -1898,6 +2280,9 @@ def main(cfg: DictConfig):
                 w_max=w_max,
                 hard_max=cfg.train.hard_max,
                 s_scale=s_scale,
+                learnable_s_scale=learnable_s_scale,
+                c1_threshold=c1_threshold,
+                c1_multiplier=c1_multiplier,
             )
 
             # When domain_expansion is active, optionally override the initial
@@ -1987,6 +2372,7 @@ def main(cfg: DictConfig):
                     -model_limit, model_limit, nx,
                     num_anchors=anchor_count,
                     expand_factor=anchor_expand,
+                    n_plant=n_plant,
                     logger=logger,
                 )
 
@@ -2034,11 +2420,6 @@ def main(cfg: DictConfig):
                 candidate_roa_states_weight=cand_weight,
                 logger=logger,
                 always_candidate_roa_regulizer=always_cand,
-                # Zubov sampling
-                zubov_sampling=cfg.train.get('zubov_sampling', False),
-                zubov_num_bands=cfg.train.get('zubov_num_bands', 5),
-                zubov_pgd_steps=cfg.train.get('zubov_pgd_steps', 30),
-                zubov_step_size=cfg.train.get('zubov_step_size', 1e-2),
                 # Domain expansion
                 domain_expansion=cfg.train.get('domain_expansion', False),
                 domain_update_interval=cfg.train.get('domain_update_interval', 10),
@@ -2048,6 +2429,7 @@ def main(cfg: DictConfig):
                 domain_max_growth=cfg.train.get('domain_max_growth', 2.0),
                 domain_hard_lower=-model_limit,
                 domain_hard_upper=model_limit,
+                v_origin_weight=cfg.loss.get('v_origin_weight', 0.0),
             )
             # Capture the final domain limits (may have grown via domain expansion)
             if _train_ret.lower_limit is not None:
@@ -2088,7 +2470,9 @@ def main(cfg: DictConfig):
         rho_multiplier=rho_mult_final,
         w_max=w_max,
         hard_max=True,
-        s_scale=s_scale,
+        s_scale=derivative_lyaloss.get_s_scale_value(),
+        c1_threshold=derivative_lyaloss.c1_threshold,
+        c1_multiplier=c1_multiplier,
     )
     
     use_adversarial_w = supply_rate.requires_disturbance and w_max is not None
@@ -2097,7 +2481,7 @@ def main(cfg: DictConfig):
         verification_loss = lyapunov.DissipativityVerificationWrapper(
             derivative_lyaloss_check, nx, nw
         )
-        limit_w = w_max
+        limit_w = w_max.to(limit.device)
         limit_joint = torch.cat([limit, limit_w])
         lower_limit_joint = torch.cat([lower_limit, -limit_w])
         upper_limit_joint = torch.cat([upper_limit, limit_w])
@@ -2180,7 +2564,6 @@ def main(cfg: DictConfig):
         wandb.log({"V_trajectory": wandb.Image(vtraj_path)})
     plt.close()
 
-    # pdb.set_trace()
     # If x_boundary was flushed (e.g. by a forced domain expansion on the last
     # iteration), repopulate it before reading rho so we don't get 0.
     if derivative_lyaloss.x_boundary is None:
@@ -2198,13 +2581,8 @@ def main(cfg: DictConfig):
     
     # Calculate and log P matrix
     with torch.no_grad():
-        eps = lyapunov_nn.eps
-        P = eps * torch.eye(lyapunov_nn.x_dim, device=device)
-        if hasattr(lyapunov_nn, 'R_frozen') and lyapunov_nn.R_frozen is not None:
-            P += lyapunov_nn.R_frozen.T @ lyapunov_nn.R_frozen
-        if hasattr(lyapunov_nn, 'R_trainable') and lyapunov_nn.R_trainable is not None:
-            P += lyapunov_nn.R_trainable.T @ lyapunov_nn.R_trainable
-        P_np = P.cpu().numpy()
+        P_eff = get_effective_P(lyapunov_nn, device=device)
+        P_np = P_eff.cpu().numpy() if P_eff is not None else None
     
     # --- FINAL PARAMETER TABLES ---
     log_parameter_tables(
@@ -2224,43 +2602,72 @@ def main(cfg: DictConfig):
     # (state_labels already built above, before pre-training block)
 
     # ── Simulate closed-loop trajectories ────────────────────────────────
-    n_vis_traj = 24
-    # Sample ICs spread across the plant state box; controller state starts at 0
+    n_vis_traj = 100
+    # Sample ICs spanning the full plot domain (grid + random)
     torch.manual_seed(42)
-    ic_plant = (torch.rand(n_vis_traj, 2, device=device) - 0.5) * 2 * limit[:2] * 0.9
+    # Grid of ICs covering the plant state box uniformly
+    n_grid_per_dim = 8  # 8×8 = 64 grid ICs
+    g1 = torch.linspace(-limit[0].item(), limit[0].item(), n_grid_per_dim, device=device)
+    g2 = torch.linspace(-limit[1].item(), limit[1].item(), n_grid_per_dim, device=device)
+    grid1, grid2 = torch.meshgrid(g1, g2, indexing='ij')
+    ic_grid = torch.stack([grid1.reshape(-1), grid2.reshape(-1)], dim=1)
+    # Random ICs filling the remaining budget
+    n_rand = max(n_vis_traj - ic_grid.shape[0], 0)
+    ic_rand = (torch.rand(n_rand, 2, device=device) - 0.5) * 2 * limit[:2]
+    ic_plant = torch.cat([ic_grid, ic_rand], dim=0)
     if nx > 2:
-        ic_ctrl = torch.zeros(n_vis_traj, nx - 2, device=device)
+        ic_ctrl = torch.zeros(ic_plant.shape[0], nx - 2, device=device)
         ic_all  = torch.cat([ic_plant, ic_ctrl], dim=1)
     else:
         ic_all = ic_plant
     traj_tensor = simulate_closed_loop(dynamics, controller, ic_all, max_steps=400)
     # traj_tensor: (T+1, N, nx)
 
-    # ── Old-style V heatmap (x1-x2 slice) ───────────────────────────────
-    fig_heat = plot_V_heatmap_with_trajectories(
-        lyapunov_nn, rho, lower_limit, upper_limit, traj_tensor,
-        title="Trained Lyapunov V  (x₃=x₄=0 slice)"
-    )
-    heatmap_path = os.path.join(os.getcwd(), "V_roa.png")
-    fig_heat.savefig(heatmap_path, dpi=150)
-    plt.close(fig_heat)
-    logger.info(f"V heatmap saved: {heatmap_path}")
-
     # ── Effective P matrix for final model ───────────────────────────────
-    with torch.no_grad():
-        P_final_eff = lyapunov_nn.eps * torch.eye(nx, device=device)
-        if hasattr(lyapunov_nn, 'R_frozen') and lyapunov_nn.R_frozen is not None:
-            P_final_eff += lyapunov_nn.R_frozen.T @ lyapunov_nn.R_frozen
-        if hasattr(lyapunov_nn, 'R_trainable') and lyapunov_nn.R_trainable is not None:
-            P_final_eff += lyapunov_nn.R_trainable.T @ lyapunov_nn.R_trainable
-        P_final_np = P_final_eff.cpu().numpy()
+    P_final_eff = get_effective_P(lyapunov_nn, device=device)
+    P_final_np = P_final_eff.cpu().numpy() if P_final_eff is not None else None
+
+    # ── ROA projection plot (trained model) ──────────────────────────────
+    if rho > 0:
+        fig_heat = plot_ellipsoid_projections(
+            P_init=None, rho_init=0.0,
+            P_final=P_final_np, rho_final=rho,
+            nx=nx, state_labels=state_labels,
+            trajectories=traj_tensor,
+            title=f"Trained ROA Projections  (ρ={rho:.5f})",
+            lyapunov_final=lyapunov_nn,
+            lower_limit_tensor=lower_limit,
+            upper_limit_tensor=upper_limit,
+        )
+        heatmap_path = os.path.join(os.getcwd(), "V_roa.png")
+        fig_heat.savefig(heatmap_path, dpi=150)
+        plt.close(fig_heat)
+        logger.info(f"ROA projection plot saved: {heatmap_path}")
+    else:
+        heatmap_path = None
+
+    # ── Flow field (vector field) plot ───────────────────────────────────
+    fig_flow = plot_flow_field(
+        dynamics=dynamics,
+        controller=controller,
+        lyapunov_nn=lyapunov_nn,
+        rho=rho,
+        lower_limit=lower_limit,
+        upper_limit=upper_limit,
+        state_labels=state_labels,
+        trajectories=traj_tensor,
+        title=f"Closed-Loop Flow Field  (ρ={rho:.5f})",
+    )
+    flow_path = os.path.join(os.getcwd(), "flow_field.png")
+    fig_flow.savefig(flow_path, dpi=150)
+    plt.close(fig_flow)
+    logger.info(f"Flow field plot saved: {flow_path}")
+    if cfg.train.wandb.enabled:
+        wandb.log({"flow_field": wandb.Image(flow_path)})
 
     # =====================================================================
     # Post-training comparison: initial vs trained ROA
     # =====================================================================
-    comparison_path     = None
-    proj_path_init      = None
-    proj_path_final     = None
     proj_path_cmp       = None
     final_verified_rho  = rho
     improvement         = 0.0
@@ -2276,18 +2683,13 @@ def main(cfg: DictConfig):
         lyapunov_init.eval()
 
         # Effective P for initial model
-        with torch.no_grad():
-            P_init_eff = lyapunov_init.eps * torch.eye(nx, device=device)
-            if hasattr(lyapunov_init, 'R_frozen') and lyapunov_init.R_frozen is not None:
-                P_init_eff += lyapunov_init.R_frozen.T @ lyapunov_init.R_frozen
-            if hasattr(lyapunov_init, 'R_trainable') and lyapunov_init.R_trainable is not None:
-                P_init_eff += lyapunov_init.R_trainable.T @ lyapunov_init.R_trainable
-            P_init_np = P_init_eff.cpu().numpy()
+        P_init_eff = get_effective_P(lyapunov_init, device=device)
+        P_init_np = P_init_eff.cpu().numpy() if P_init_eff is not None else None
 
         # ── PGD bisection on trained model ────────────────────────────────
         final_verified_rho, final_max_rho, final_clean = pgd_find_verified_rho(
             lyapunov_nn, dynamics, controller, supply_rate,
-            lower_limit, upper_limit, w_max, s_scale,
+            lower_limit, upper_limit, w_max, derivative_lyaloss.get_s_scale_value(),
             V_decrease_within_roa=V_decrease_within_roa,
             pgd_steps=cfg.get('pgd_verifier_steps', 300),
             num_seeds=cfg.get('pgd_verifier_num_seeds', 5),
@@ -2296,6 +2698,8 @@ def main(cfg: DictConfig):
             rho_bisect_tol=cfg.get('verify_init_rho_tol', 0.005),
             max_bisect_iters=cfg.get('verify_init_max_bisect', 20),
             logger=logger,
+            c1_threshold=derivative_lyaloss.c1_threshold,
+            c1_multiplier=c1_multiplier,
         )
 
         logger.info(f"Initial verified rho:  {init_rho:.6f}")
@@ -2319,67 +2723,14 @@ def main(cfg: DictConfig):
                 dynamics=dynamics,
                 controller=controller,
                 supply_rate_fn=supply_rate,
-                s_scale=s_scale,
+                s_scale=derivative_lyaloss.get_s_scale_value(),
                 rho=final_verified_rho,
                 nx=nx,
                 logger=logger,
                 label="POST-TRAINING",
             )
 
-        # ── Old-style V heatmap comparison (x1-x2 slice) ─────────────────
-        fig_cmp = plot_roa_comparison(
-            V_init_fn=lyapunov_init,
-            rho_init=init_rho,
-            V_final_fn=lyapunov_nn,
-            rho_final=final_verified_rho,
-            lower_limit=lower_limit,
-            upper_limit=upper_limit,
-            nx=nx,
-            logger=logger,
-        )
-        comparison_path = os.path.join(os.getcwd(), "V_roa_comparison.png")
-        fig_cmp.savefig(comparison_path, dpi=150)
-        plt.close(fig_cmp)
-        logger.info(f"Comparison heatmap saved:    {comparison_path}")
-
-        # ── Ellipsoid projection: initial model only ──────────────────────
-        if init_rho > 0:
-            fig_proj_init = plot_ellipsoid_projections(
-                P_init   = P_init_np,
-                rho_init = init_rho,
-                P_final  = None,
-                rho_final= 0.0,
-                nx       = nx,
-                state_labels = state_labels,
-                trajectories = None,
-                title    = f"Initial ROA Projections  (ρ₀={init_rho:.5f})",
-            )
-            proj_path_init = os.path.join(os.getcwd(), "roa_proj_init.png")
-            fig_proj_init.savefig(proj_path_init, dpi=150)
-            plt.close(fig_proj_init)
-            logger.info(f"Initial ROA projections saved: {proj_path_init}")
-
-        # ── Ellipsoid projection: trained model only (+ nonlinear overlay) ─
-        if final_verified_rho > 0:
-            fig_proj_final = plot_ellipsoid_projections(
-                P_init   = None,
-                rho_init = 0.0,
-                P_final  = P_final_np,
-                rho_final= final_verified_rho,
-                nx       = nx,
-                state_labels = state_labels,
-                trajectories = traj_tensor,
-                title    = f"Trained ROA Projections  (ρ={final_verified_rho:.5f})",
-                lyapunov_final      = lyapunov_nn,
-                lower_limit_tensor  = lower_limit,
-                upper_limit_tensor  = upper_limit,
-            )
-            proj_path_final = os.path.join(os.getcwd(), "roa_proj_final.png")
-            fig_proj_final.savefig(proj_path_final, dpi=150)
-            plt.close(fig_proj_final)
-            logger.info(f"Trained ROA projections saved: {proj_path_final}")
-
-        # ── Ellipsoid projection: both overlaid (+ nonlinear overlay) ────
+        # ── ROA projection comparison (init vs trained + exact V(x)=ρ) ───
         if init_rho > 0 or final_verified_rho > 0:
             fig_proj_cmp = plot_ellipsoid_projections(
                 P_init   = P_init_np   if init_rho > 0           else None,
@@ -2437,6 +2788,225 @@ def main(cfg: DictConfig):
         wandb.run.summary["final_pgd_violations"] = int((adv_output > 0).sum().item())
         wandb.run.summary["final_max_violation"] = float(max_adv_violation)
         wandb.run.summary["final_verification_success"] = not pgd_verifier_find_counterexamples
+
+    # =====================================================================
+    # Formal Verification (α,β-CROWN) — optional, triggered by config
+    # =====================================================================
+    final_crown_rho = 0.0
+
+    if formal_verification_enabled and verify_final_crown and final_verified_rho > 0:
+        init_rho_formal = final_verified_rho
+        final_crown_rho = run_crown_verification(
+            cfg, formal_cfg, derivative_lyaloss_check, init_rho_formal, logger,
+            label="final (post-training)",
+            verify_subdir="formal_verification_final",
+        )
+        if cfg.train.wandb.enabled:
+            wandb.run.summary["formal_verified_rho"] = final_crown_rho
+            wandb.run.summary["formal_verification_success"] = final_crown_rho > 0
+    elif formal_verification_enabled and final_verified_rho <= 0:
+        logger.info("Skipping formal verification: no valid PGD-verified rho found.")
+
+    # =====================================================================
+    # PGD vs CROWN Comparison (projection plot with extra ρ levels)
+    # =====================================================================
+    if formal_verification_enabled and (init_crown_rho > 0 or final_crown_rho > 0):
+        try:
+            extra_levels = []
+            if final_verified_rho > 0:
+                extra_levels.append((final_verified_rho, 'lime', '-', f'PGD ρ={final_verified_rho:.5f}'))
+            fig_crown_cmp = plot_ellipsoid_projections(
+                P_init=P_init_np if (verify_init and init_rho > 0) else None,
+                rho_init=init_crown_rho if init_crown_rho > 0 else init_rho,
+                P_final=P_final_np,
+                rho_final=final_crown_rho if final_crown_rho > 0 else final_verified_rho,
+                nx=nx, state_labels=state_labels,
+                trajectories=traj_tensor if 'traj_tensor' in locals() else None,
+                title=f"PGD vs CROWN  (ρ_CROWN={final_crown_rho:.5f})",
+                lyapunov_final=lyapunov_nn,
+                lower_limit_tensor=lower_limit,
+                upper_limit_tensor=upper_limit,
+                extra_rho_levels=extra_levels if extra_levels else None,
+            )
+            crown_cmp_path = os.path.join(os.getcwd(), "roa_pgd_vs_crown.png")
+            fig_crown_cmp.savefig(crown_cmp_path, dpi=150)
+            plt.close(fig_crown_cmp)
+            logger.info(f"PGD vs CROWN comparison saved: {crown_cmp_path}")
+
+            if cfg.train.wandb.enabled:
+                wandb.log({"roa_pgd_vs_crown": wandb.Image(crown_cmp_path)})
+                wandb.run.summary["init_crown_rho"] = init_crown_rho
+                wandb.run.summary["final_crown_rho"] = final_crown_rho
+        except Exception as e:
+            logger.error(f"Failed to generate comparison plot: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # =====================================================================
+    # 4-Region Comparison Plot: Init PGD / Init CROWN / Final PGD / Final CROWN
+    # =====================================================================
+    have_init = init_rho > 0
+    have_final = (final_verified_rho > 0 or final_crown_rho > 0)
+    if formal_verification_enabled and have_init and have_final:
+        try:
+            import itertools as _it
+            _pairs = list(_it.combinations(range(nx), 2))
+            _ncols = min(3, len(_pairs))
+            _nrows = int(np.ceil(len(_pairs) / _ncols))
+            fig4, axes4 = plt.subplots(_nrows, _ncols, figsize=(6 * _ncols, 5.5 * _nrows))
+            axes4_flat = np.array(axes4).flatten() if len(_pairs) > 1 else [axes4]
+
+            # Pre-compute nonlinear projection grid for final lyapunov
+            _max_rho = max(final_verified_rho, final_crown_rho, init_rho, init_crown_rho)
+            _proj4 = {}
+            if lyapunov_nn is not None and lower_limit is not None and upper_limit is not None:
+                for (pi, pj) in _pairs:
+                    _proj4[(pi, pj)] = compute_projected_levelset(
+                        lyapunov_nn, _max_rho, pi, pj,
+                        lower_limit, upper_limit,
+                        grid_size=80, n_opt_steps=200,
+                    )
+
+            # Region specs: (rho, color, linestyle, label, is_init)
+            _regions = []
+            if init_rho > 0:
+                _regions.append((init_rho, '#00bfff', '--', f'Init PGD ρ={init_rho:.4f}', True))
+            if init_crown_rho > 0:
+                _regions.append((init_crown_rho, '#ff6b6b', '--', f'Init CROWN ρ={init_crown_rho:.4f}', True))
+            if final_verified_rho > 0:
+                _regions.append((final_verified_rho, 'lime', '-', f'Final PGD ρ={final_verified_rho:.4f}', False))
+            if final_crown_rho > 0:
+                _regions.append((final_crown_rho, 'orange', '-', f'Final CROWN ρ={final_crown_rho:.4f}', False))
+
+            for idx, (i, j) in enumerate(_pairs):
+                ax = axes4_flat[idx]
+                A_sel = np.zeros((2, nx)); A_sel[0, i] = 1.0; A_sel[1, j] = 1.0
+
+                for (rho_val, color, ls, label_str, is_init_region) in _regions:
+                    if rho_val <= 0:
+                        continue
+                    if is_init_region and P_init_np is not None:
+                        # Init regions are ellipsoidal (pure quadratic)
+                        try:
+                            Phat = project_ellipsoid(P_init_np, A_sel)
+                            ex, ey = ellipse_from_Phat(Phat, rho_val)
+                            ax.plot(ex, ey, color=color, linewidth=2, linestyle=ls, zorder=5)
+                            ax.fill(ex, ey, alpha=0.06, color=color)
+                            if idx == 0:
+                                ax.plot([], [], color=color, linewidth=2, linestyle=ls, label=label_str)
+                        except Exception:
+                            pass
+                    elif not is_init_region and (i, j) in _proj4:
+                        # Final regions use nonlinear level sets
+                        xi_v, xj_v, V_proj = _proj4[(i, j)]
+                        try:
+                            ax.contour(xi_v, xj_v, V_proj, levels=[rho_val],
+                                       colors=[color], linewidths=[2.5], linestyles=[ls], zorder=8)
+                            ax.contourf(xi_v, xj_v, V_proj, levels=[-np.inf, rho_val],
+                                        colors=[color], alpha=0.08, zorder=7)
+                            if idx == 0:
+                                ax.plot([], [], color=color, linewidth=2.5, linestyle=ls, label=label_str)
+                        except Exception:
+                            pass
+
+                ax.axhline(0, color='white', linewidth=0.4, alpha=0.4)
+                ax.axvline(0, color='white', linewidth=0.4, alpha=0.4)
+                ax.set_xlabel(state_labels[i], fontsize=11)
+                ax.set_ylabel(state_labels[j], fontsize=11)
+                ax.set_facecolor('#1a1a2e')
+                ax.grid(True, alpha=0.25)
+                ax.set_aspect('equal', adjustable='datalim')
+                if idx == 0:
+                    ax.legend(fontsize=8, loc='upper right')
+
+            for idx in range(len(_pairs), len(axes4_flat)):
+                axes4_flat[idx].set_visible(False)
+
+            fig4.suptitle("4-Region ROA Comparison", fontsize=13, fontweight='bold')
+            fig4.tight_layout()
+            four_region_path = os.path.join(os.getcwd(), "roa_4region_comparison.png")
+            fig4.savefig(four_region_path, dpi=150)
+            plt.close(fig4)
+            logger.info(f"4-region comparison saved: {four_region_path}")
+        except Exception as e:
+            logger.error(f"Failed to generate 4-region comparison: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # =====================================================================
+    # Save results JSON for comparison scripts
+    # =====================================================================
+    import json as _json
+
+    # Compute projected ROA area on plant states (dim 0, 1) for all 4 rho values
+    def _compute_area(rho_val):
+        if rho_val <= 1e-6:
+            return 0.0
+        try:
+            return compute_roa_volume_projected(
+                lyapunov_nn, rho_val, dim_i=0, dim_j=1,
+                lower_limit=lower_limit, upper_limit=upper_limit,
+                grid_size=200, n_opt_steps=200,
+            )
+        except Exception as e:
+            logger.warning(f"ROA volume computation failed for rho={rho_val}: {e}")
+            return 0.0
+
+    roa_area_final_pgd = _compute_area(final_verified_rho)
+    roa_area_final_crown = _compute_area(final_crown_rho)
+    # Init areas use quadratic V = x'Px → ellipsoid area = π·√(ρ²/det(P_sub))
+    def _ellipsoid_area(P_np, rho_val):
+        if P_np is None or rho_val <= 1e-6:
+            return 0.0
+        P_sub = P_np[:2, :2]  # plant states (θ, θ̇)
+        det_P = np.linalg.det(P_sub)
+        if det_P <= 0:
+            return 0.0
+        return np.pi * rho_val / np.sqrt(det_P)
+    roa_area_init_pgd = _ellipsoid_area(P_init_np, init_rho)
+    roa_area_init_crown = _ellipsoid_area(P_init_np, init_crown_rho)
+
+    if roa_area_final_pgd > 0:
+        logger.info(f"ROA area (final PGD): {roa_area_final_pgd:.6f}")
+    if roa_area_final_crown > 0:
+        logger.info(f"ROA area (final CROWN): {roa_area_final_crown:.6f}")
+    if roa_area_init_pgd > 0:
+        logger.info(f"ROA area (init PGD, ellipsoid): {roa_area_init_pgd:.6f}")
+    if roa_area_init_crown > 0:
+        logger.info(f"ROA area (init CROWN, ellipsoid): {roa_area_init_crown:.6f}")
+
+    # Sanitize NaN values
+    _safe_rho = float(final_verified_rho) if not (isinstance(final_verified_rho, float) and final_verified_rho != final_verified_rho) else 0.0
+    import math
+    if math.isnan(_safe_rho):
+        _safe_rho = 0.0
+
+    results = {
+        "V_psd_form": cfg.model.V_psd_form,
+        "init_pgd_rho": float(init_rho) if not math.isnan(float(init_rho)) else 0.0,
+        "init_crown_rho": float(init_crown_rho) if not math.isnan(float(init_crown_rho)) else 0.0,
+        "final_pgd_rho": _safe_rho,
+        "final_crown_rho": float(final_crown_rho) if not math.isnan(float(final_crown_rho)) else 0.0,
+        "roa_area_init_pgd": float(roa_area_init_pgd),
+        "roa_area_init_crown": float(roa_area_init_crown),
+        "roa_area_final_pgd": float(roa_area_final_pgd),
+        "roa_area_final_crown": float(roa_area_final_crown),
+        "roa_area_plant": float(roa_area_final_pgd),  # backward compat
+        "learnable_s_scale": bool(cfg.loss.get('learnable_s_scale', False)),
+        "learnable_nn_scale": bool(lya_cfg.get('learnable_nn_scale', False)),
+        "nn_scale_final": float(lyapunov_nn.get_nn_scale_value()),
+        "use_trainable_quadratic": bool(lya_cfg.get('use_trainable_quadratic', False)),
+        "hidden_widths": list(cfg.model.lyapunov.hidden_widths) if cfg.model.lyapunov.get('hidden_widths') else [],
+        "trainable_controller": bool(cfg.model.controller.get(cfg.model.controller.type, {}).get('trainable', False)),
+        "init_roa_anchor_expand": float(cfg.get('init_roa_anchor_expand', 1.2)),
+        "run_dir": os.getcwd(),
+    }
+    results_path = os.path.join(os.getcwd(), "results.json")
+    with open(results_path, "w") as _f:
+        _json.dump(results, _f, indent=2)
+    logger.info(f"Results JSON saved: {results_path}")
+
+    if cfg.train.wandb.enabled:
         wandb.finish()
 
     pass

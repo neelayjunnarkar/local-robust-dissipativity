@@ -430,7 +430,7 @@ def calc_candidate_roa_regulizer(
     """
     Compute weight * sum(max(V(x)/rho - 1, 0))
     """
-    if x is not None:
+    if x is not None and rho > 0:
         q = lyap_nn(x) / rho - 1
         return weight * torch.nn.functional.relu(q).mean()
     else:
@@ -577,6 +577,7 @@ def batch_train_lyapunov(
     logger: logging.Logger,
     always_candidate_roa_regulizer: bool,
     enable_wandb: bool = False,
+    v_origin_weight: float = 0.0,
 ) -> BatchTrainLyapunovReturn:
     """
     Minimize the Lyapunov function loss
@@ -612,6 +613,10 @@ def batch_train_lyapunov(
     params = []
     for dict in params_dict:
         params += dict["params"]
+    # If s_scale is learnable, add its log-space parameter to the optimizer.
+    if getattr(derivative_lyaloss, '_s_scale_learnable', False):
+        params_dict.append({"params": [derivative_lyaloss._log_s_scale], "lr": lr})
+        params.append(derivative_lyaloss._log_s_scale)
     optimizer = torch.optim.Adam(params_dict, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer, milestones=[int(epochs * 0.3), int(epochs * 0.6)], gamma=0.5
@@ -636,11 +641,20 @@ def batch_train_lyapunov(
     if derivative_lyaloss.x_boundary is not None:
         dataset_size = derivative_lyaloss.x_boundary.shape[0]
         rho_value = derivative_lyaloss.get_rho().item()
+        c1_val = getattr(derivative_lyaloss, 'c1_threshold', 0.0)
+        c1_info = f", c1={c1_val:.6f}" if c1_val > 0 else ""
+        nn_scale_val = derivative_lyaloss.lyapunov.get_nn_scale_value()
+        nn_scale_info = f", nn_scale={nn_scale_val:.4f}" if derivative_lyaloss.lyapunov._learnable_nn_scale else ""
         logger.info(
-            f"rho is {rho_value}, dataset size={dataset_size}"
+            f"rho is {rho_value}, dataset size={dataset_size}{c1_info}{nn_scale_info}"
         )
+        log_dict = {"rho": rho_value, "dataset_size": dataset_size}
+        if c1_val > 0:
+            log_dict["c1_threshold"] = c1_val
+        if derivative_lyaloss.lyapunov._learnable_nn_scale:
+            log_dict["nn_scale"] = nn_scale_val
         if enable_wandb:
-            wandb.log({"rho": rho_value, "dataset_size": dataset_size})
+            wandb.log(log_dict)
 
     called_optimizer_step = False
     derivative_loss_init = compute_sample_loss(
@@ -731,7 +745,22 @@ def batch_train_lyapunov(
                     candidate_roa_states_weight,
                 ).to(device)
                 loss += candidate_roa_regulizer
-            if loss > 0:
+
+            # ── ROA-growth regulariser ────────────────────────────────────────
+            # Minimise -weight × min_{x∈∂B} V(x)  (i.e. maximise min V on box
+            # boundary) so that ρ grows.  Run unconditionally: we want upward
+            # pressure on V(x_boundary) even when there are zero violations.
+            has_roa_growth = (
+                Vmin_x_boundary_weight != 0
+                and Vmin_x_boundary.shape[0] > 0
+            )
+            if has_roa_growth:
+                Vmin_bdry = derivative_lyaloss.lyapunov(Vmin_x_boundary).min()
+                loss = loss - Vmin_x_boundary_weight * Vmin_bdry
+
+            # Take a gradient step if there are violations OR the ROA-growth
+            # term is active (loss may be negative from that term alone).
+            if loss > 0 or has_roa_growth:
                 l1_loss = torch.tensor(0.0, device=device)
                 lya_params_list = [p.contiguous().view(-1) for p in derivative_lyaloss.lyapunov.parameters()]
                 if lya_params_list:
@@ -739,7 +768,7 @@ def batch_train_lyapunov(
                     l1_loss += torch.norm(lya_params, 1) / total_elements_lya
                 
                 if not train_clf:
-                    con_params_list = [p.view(-1) for p in derivative_lyaloss.controller.parameters()]
+                    con_params_list = [p.reshape(-1) for p in derivative_lyaloss.controller.parameters()]
                     if con_params_list:
                         con_params = torch.cat(con_params_list)
                         l1_loss += torch.norm(con_params, 1) / total_elements_con / 10
@@ -752,6 +781,13 @@ def batch_train_lyapunov(
                 if observer_loss is not None and observer_ratio > 0:
                     loss += observer_ratio * observer_loss(observer_x_samples).mean()
                 loss += l1_reg * l1_loss
+
+                # V(x*) ≈ 0 regularization for nn_sigmoid (not structurally enforced)
+                if v_origin_weight > 0:
+                    goal = derivative_lyaloss.lyapunov.goal_state.unsqueeze(0)
+                    V_origin = derivative_lyaloss.lyapunov(goal).squeeze()
+                    loss = loss + v_origin_weight * V_origin
+
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(params, 1)
@@ -808,6 +844,8 @@ def batch_train_lyapunov(
                 print_msg += (
                     f"candidate_roa_regulizer={candidate_roa_regulizer.item()}, "
                 )
+            if getattr(derivative_lyaloss, '_s_scale_learnable', False):
+                print_msg += f"s_scale={derivative_lyaloss.get_s_scale_value():.4e}, "
             if called_optimizer_step:
                 logger.info(print_msg)
             if buffer_loss == 0:
@@ -884,11 +922,6 @@ def train_lyapunov_with_buffer(
     train_clf: bool = False,
     logger: logging.Logger = None,
     always_candidate_roa_regulizer: bool = False,
-    # Zubov sampling parameters
-    zubov_sampling: bool = False,
-    zubov_num_bands: int = 5,
-    zubov_pgd_steps: int = 30,
-    zubov_step_size: float = 1e-2,
     # Dynamic domain expansion parameters
     domain_expansion: bool = False,
     domain_update_interval: int = 10,
@@ -898,7 +931,7 @@ def train_lyapunov_with_buffer(
     domain_max_growth: float = 2.0,
     domain_hard_lower: typing.Optional[torch.Tensor] = None,
     domain_hard_upper: typing.Optional[torch.Tensor] = None,
-    domain_traj_pgd_steps: int = 100,
+    v_origin_weight: float = 0.0,
 ) -> TrainLyapunovWithBufferReturn:
     """
     We train the Lyapunov and controller iteratively.
@@ -952,7 +985,7 @@ def train_lyapunov_with_buffer(
         if domain_expansion and i > 0 and i % domain_update_interval == 0:
             from neural_lyapunov_training.domain_expansion import update_domain_from_trajectories
             rho_for_expand = derivative_lyaloss.get_rho().item() if hasattr(derivative_lyaloss, 'get_rho') else 1.0
-            new_lower, new_upper, n_conv = update_domain_from_trajectories(
+            new_lower, new_upper, n_conv, domain_grew = update_domain_from_trajectories(
                 dynamics=derivative_lyaloss.dynamics,
                 controller=derivative_lyaloss.controller,
                 lyapunov_fn=derivative_lyaloss.lyapunov,
@@ -966,9 +999,8 @@ def train_lyapunov_with_buffer(
                 max_growth=domain_max_growth,
                 hard_lower=domain_hard_lower,
                 hard_upper=domain_hard_upper,
-                traj_pgd_steps=domain_traj_pgd_steps,
             )
-            if n_conv > 0:
+            if domain_grew:
                 lower_limit = new_lower
                 upper_limit = new_upper
                 limit = (upper_limit - lower_limit) / 2.0
@@ -1010,20 +1042,22 @@ def train_lyapunov_with_buffer(
             # Joint optimization over [x, w]
             from neural_lyapunov_training.lyapunov import DissipativityVerificationWrapper
             w_max = derivative_lyaloss.w_max
-            limit_w = w_max
+            limit_w = w_max.to(limit.device)
             limit_joint = torch.cat([limit, limit_w])
             lower_boundary_joint = torch.cat([lower_limit, -limit_w])
             upper_boundary_joint = torch.cat([upper_limit, limit_w])
-            
-            verification_wrapper = DissipativityVerificationWrapper(derivative_lyaloss, nx, nw)
-            clean_xw = (
-                (
-                    torch.rand((samples_per_iter, nx + nw), device=device, dtype=dtype)
-                    - 0.5
-                )
-                * limit_joint
-                * 2
+
+            clean_x_seed = (
+                (torch.rand((samples_per_iter, nx), device=device, dtype=dtype) - 0.5)
+                * limit * 2
             )
+            clean_w_seed = (
+                (torch.rand((clean_x_seed.shape[0], nw), device=device, dtype=dtype) - 0.5)
+                * limit_w * 2
+            )
+            clean_xw = torch.cat([clean_x_seed, clean_w_seed], dim=1)
+
+            verification_wrapper = DissipativityVerificationWrapper(derivative_lyaloss, nx, nw)
             derivative_adv_x = pgd_attack(
                 clean_xw,
                 verification_wrapper,
@@ -1035,28 +1069,14 @@ def train_lyapunov_with_buffer(
             ).detach()
             clean_x = clean_xw[:, :nx]
         else:
-            if zubov_sampling and hasattr(derivative_lyaloss, 'get_rho'):
-                from neural_lyapunov_training.zubov_sampling import zubov_sample
-                rho_val = derivative_lyaloss.get_rho().item()
-                clean_x = zubov_sample(
-                    lyapunov_fn=derivative_lyaloss.lyapunov,
-                    rho=rho_val,
-                    lower_limit=lower_limit,
-                    upper_limit=upper_limit,
-                    num_samples=samples_per_iter,
-                    num_bands=zubov_num_bands,
-                    pgd_steps=zubov_pgd_steps,
-                    step_size=zubov_step_size,
+            clean_x = (
+                (
+                    torch.rand((samples_per_iter, nx), device=device, dtype=dtype)
+                    - torch.full((nx,), 0.5, device=device, dtype=dtype)
                 )
-            else:
-                clean_x = (
-                    (
-                        torch.rand((samples_per_iter, nx), device=device, dtype=dtype)
-                        - torch.full((nx,), 0.5, device=device, dtype=dtype)
-                    )
-                    * limit
-                    * 2
-                )
+                * limit
+                * 2
+            )
             derivative_adv_x = pgd_attack(
                 clean_x,
                 derivative_lyaloss,
@@ -1106,7 +1126,7 @@ def train_lyapunov_with_buffer(
                 consecutive_satisfied_iters = 0
                 from neural_lyapunov_training.domain_expansion import update_domain_from_trajectories
                 rho_for_expand = derivative_lyaloss.get_rho().item() if hasattr(derivative_lyaloss, 'get_rho') else 1.0
-                new_lower, new_upper, n_conv = update_domain_from_trajectories(
+                new_lower, new_upper, n_conv, domain_grew = update_domain_from_trajectories(
                     dynamics=derivative_lyaloss.dynamics,
                     controller=derivative_lyaloss.controller,
                     lyapunov_fn=derivative_lyaloss.lyapunov,
@@ -1120,9 +1140,8 @@ def train_lyapunov_with_buffer(
                     max_growth=domain_max_growth,
                     hard_lower=domain_hard_lower,
                     hard_upper=domain_hard_upper,
-                    traj_pgd_steps=domain_traj_pgd_steps,
                 )
-                if n_conv > 0:
+                if domain_grew:
                     lower_limit = new_lower
                     upper_limit = new_upper
                     limit = (upper_limit - lower_limit) / 2.0
@@ -1132,9 +1151,22 @@ def train_lyapunov_with_buffer(
                         derivative_lyaloss.box_up = upper_limit
                     # Flush x_boundary buffer — old points from the ±old box boundary
                     # have small V values and keep rho pinned. Clear so they get
-                    # resampled from the new larger boundary next iteration.
+                    # resampled from the new larger boundary.
                     Vmin_x_pgd = torch.empty((0, nx), device=device)
                     derivative_lyaloss.x_boundary = None
+                    # Immediately repopulate x_boundary for the new domain so
+                    # get_rho() returns a valid (non-zero) value and avoids
+                    # division-by-zero in candidate_roa_regulizer.
+                    Vmin_x_pgd = update_x_boundary_dataset(
+                        Vmin_x_boundary_weight,
+                        V_decrease_within_roa,
+                        Vmin_x_pgd,
+                        derivative_lyaloss,
+                        lower_limit,
+                        upper_limit,
+                        num_samples_per_boundary,
+                        Vmin_x_pgd_buffer_size,
+                    )
                     domain_expansion_count += 1
                     logger.info(f"Domain updated (forced): lower={lower_limit.tolist()}, upper={upper_limit.tolist()}")
                     if enable_wandb:
@@ -1148,7 +1180,7 @@ def train_lyapunov_with_buffer(
                         })
                 else:
                     logger.info(
-                        "Domain expansion found no converging trajectories beyond current box. "
+                        "Domain expansion: domain did not grow. "
                         "Stopping — ROA boundary reached."
                     )
                     break
@@ -1210,6 +1242,7 @@ def train_lyapunov_with_buffer(
             logger,
             always_candidate_roa_regulizer,
             enable_wandb,
+            v_origin_weight,
         )
         elapsed_time = time.time() - start_time
         logger.info(f"elapsed time = {elapsed_time}")
@@ -1230,24 +1263,27 @@ def train_lyapunov_with_buffer(
                 }
                 if hasattr(derivative_lyaloss, "get_rho"):
                     model_dict["rho"] = derivative_lyaloss.get_rho()
+                if hasattr(derivative_lyaloss, "get_s_scale_value"):
+                    model_dict["s_scale"] = derivative_lyaloss.get_s_scale_value()
                 torch.save(
                     model_dict,
                     save_best_model,
                 )
         if enable_wandb:
-            wandb.log(
-                {
-                    "buffer_loss": batch_train_lyapunov_ret.buffer_loss,
-                    "adv_loss": batch_train_lyapunov_ret.buffer_loss,
-                    "adv_sample": batch_train_lyapunov_ret.derivative_buffer_ret.unsatisfied,
-                    "l1_loss": batch_train_lyapunov_ret.l1_loss,
-                    "roa_loss": batch_train_lyapunov_ret.roa_loss,
-                    "candidate_roa_regulizer": batch_train_lyapunov_ret.roa_loss,
-                    "epoch": batch_train_lyapunov_ret.epoch,
-                    "initial_buffer_loss": batch_train_lyapunov_ret.derivative_buffer_ret_init.loss,
-                    "initial_buffer_violations": batch_train_lyapunov_ret.derivative_buffer_ret_init.unsatisfied,
-                }
-            )
+            wandb_dict = {
+                "buffer_loss": batch_train_lyapunov_ret.buffer_loss,
+                "adv_loss": batch_train_lyapunov_ret.buffer_loss,
+                "adv_sample": batch_train_lyapunov_ret.derivative_buffer_ret.unsatisfied,
+                "l1_loss": batch_train_lyapunov_ret.l1_loss,
+                "roa_loss": batch_train_lyapunov_ret.roa_loss,
+                "candidate_roa_regulizer": batch_train_lyapunov_ret.roa_loss,
+                "epoch": batch_train_lyapunov_ret.epoch,
+                "initial_buffer_loss": batch_train_lyapunov_ret.derivative_buffer_ret_init.loss,
+                "initial_buffer_violations": batch_train_lyapunov_ret.derivative_buffer_ret_init.unsatisfied,
+            }
+            if getattr(derivative_lyaloss, '_s_scale_learnable', False):
+                wandb_dict["s_scale"] = derivative_lyaloss.get_s_scale_value()
+            wandb.log(wandb_dict)
     return TrainLyapunovWithBufferReturn(
         derivative_adv_samples=derivative_x_buffer,
         x_min_boundary=Vmin_x_pgd,
@@ -1282,6 +1318,10 @@ def set_seed(seed):
     torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def calc_V_extreme_on_boundary_pgd(

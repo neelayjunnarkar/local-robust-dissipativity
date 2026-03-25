@@ -2,8 +2,8 @@ run_dir: ./output/pendulum_state/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
 wandb_enabled: True 
 wandb_entity: NN-verification  # Wandb team name 
-wandb_project: pendulum_state_training_lti_controller  # Wandb project name
+wandb_project: pendulum_small_torque_rinn_controller_final_2  # Wandb project name
 
 load_lyaloss: examples/data/pendulum/state_feedback/lyaloss_init.pth
-Vmin_x_pgd_path: null 
+Vmin_x_pgd_path: null
 derivative_x_buffer_path: null 

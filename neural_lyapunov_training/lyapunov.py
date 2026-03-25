@@ -18,13 +18,6 @@ def soft_max(x: torch.Tensor, beta: float = 100):
     return ret
 
 
-def logsumexp(x: torch.Tensor, beta: float = 100):
-    x_max = torch.max(x, dim=-1, keepdim=True).values
-    eq = torch.exp(beta * (x - x_max))
-    if torch.any(torch.isnan(eq)):
-        raise Exception("logsumexp contains NAN, consider to reduce beta.")
-    return torch.log(torch.sum(eq, dim=-1, keepdim=True)) / beta
-
 
 def soft_min(x: torch.Tensor, beta: float = 100):
     return -soft_max(-x, beta)
@@ -42,8 +35,16 @@ class NeuralNetworkLyapunov(nn.Module):
     (x-x*)ᵀ(εI+RᵀR)(x-x*) if V_psd_form = "quadratic".
     |R(x-x*)|₁ if V_psd_form = "L1_R_free"
 
+    Pure-NN forms (no quadratic base):
+    sigmoid(NN(x))              if V_psd_form = "nn_sigmoid"
+    α · |NN(x) - NN(x*)|       if V_psd_form = "nn_abs"
+    α · (NN(x) - NN(x*))²      if V_psd_form = "nn_sq"
+
     The optimizable parameters are the network ϕ and R.
     """
+
+    # All V_psd_form values that are "pure NN" (no quadratic base).
+    _PURE_NN_FORMS = {"nn_sigmoid", "nn_abs", "nn_sq", "nn_sigmoid_c1", "nn_sigmoid_abs"}
 
     def __init__(
         self,
@@ -59,6 +60,7 @@ class NeuralNetworkLyapunov(nn.Module):
         V_psd_form: str = "L1",
         use_nonlinear: bool = True,
         nn_scale: float = 0.5,
+        learnable_nn_scale: bool = False,
         *args,
         **kwargs
     ):
@@ -77,9 +79,34 @@ class NeuralNetworkLyapunov(nn.Module):
             "quadratic_times_tanh" (V = x'Px · (1+α·tanh(NN)), α=nn_scale), or
             "quadratic_times_exp"  (V = x'Px · exp(NN)).
             Any "quadratic_times_*" form: NN zero-init ⇒ multiplier=1 at init.
+            "quadratic_plus_sq"    (V = x'Px + α·(NN(x)−NN(0))²).  CROWN-friendly:
+              additive (BoundAdd), no cross-product term.  Use tanh hidden layers
+              with a linear output layer for smooth + tight CROWN bounds.
+            "quadratic_plus_abs"   (V = x'Px + α·|NN(x)−NN(0)|).  CROWN-friendly:
+              uses torch.abs() → auto_LiRPA BoundAbs (purpose-built, tight bounds).
+              Allows signed NN contribution (linear growth in φ, not squared).
+            "nn_sigmoid"  (V = sigmoid(NN(x))).  Pure-NN, no quadratic base.
+              Inspired by Li et al. (2025).  V ∈ (0,1), V(x*) ≈ 0 (minimized).
+              CROWN: BoundSigmoid (subclass of BoundTanh).
+            "nn_sigmoid_c1"  (V = sigmoid(NN(x))).  Same as nn_sigmoid but
+              designed for c₁-exclusion training (two-stage paper approach).
+              Training excludes region V(x) < c₁ from decrease condition.
+            "nn_sigmoid_abs"  (V = α·|σ(NN(x))−σ(NN(x*))|).  Pure-NN.
+              Structural V(x*)=0 via abs of sigmoid difference.
+              Bounded in [0, α], smooth sigmoid + abs.
+            "nn_abs"  (V = α·|NN(x)−NN(x*)|).  Pure-NN, no quadratic base.
+              V(x*)=0 exactly, V≥0.  CROWN: BoundAbs (tight, purpose-built).
+            "nn_sq"   (V = α·(NN(x)−NN(x*))²).  Pure-NN, no quadratic base.
+              V(x*)=0 exactly, V≥0, smooth.  CROWN: BoundSqr (optimizable).
+            "quadratic_plus_sigmoid"  (V = x'Px + α·|σ(NN(x))−σ(NN(x*))|).
+              Quadratic base + bounded sigmoid NN term.
+              V(x*)=0 structurally.  Quadratic handles near-origin,
+              sigmoid adds bounded flexibility far from origin.
           use_nonlinear: Whether to include the NN component.
           nn_scale: α for "quadratic_times_tanh" — multiplier ∈ (1-α, 1+α).
-            Must be in (0,1) for that form. Ignored for "quadratic_times_exp".
+            Must be in (0,1) for that form. Also used as α in "quadratic_plus_sq",
+            "quadratic_plus_abs", "nn_abs", "nn_sq".
+            Ignored for "quadratic_times_exp" and "nn_sigmoid".
         """
         super().__init__(*args, **kwargs)
         self.goal_state = goal_state
@@ -90,17 +117,28 @@ class NeuralNetworkLyapunov(nn.Module):
         self.use_nonlinear = use_nonlinear
         if V_psd_form == "quadratic_times_tanh":
             assert 0 < nn_scale < 1, f"nn_scale must be in (0,1) for quadratic_times_tanh, got {nn_scale}"
-        self.nn_scale = nn_scale
+        self._learnable_nn_scale = learnable_nn_scale
+        if learnable_nn_scale:
+            self._log_nn_scale = nn.Parameter(torch.log(torch.tensor(float(nn_scale))))
+        else:
+            self._nn_scale_fixed = float(nn_scale)
+        self._is_pure_nn = V_psd_form in self._PURE_NN_FORMS
+        # quadratic_plus_sigmoid has R matrices despite using sigmoid NN
+        self._has_quadratic_base = (not self._is_pure_nn) or V_psd_form == "quadratic_plus_sigmoid"
         
-        # Linear/Quadratic components (R matrices)
-        if R_frozen is not None:
-            self.register_buffer('R_frozen', R_frozen.clone())
+        # Linear/Quadratic components (R matrices) — skipped for pure-NN forms (except quadratic_plus_sigmoid)
+        if self._has_quadratic_base:
+            if R_frozen is not None:
+                self.register_buffer('R_frozen', R_frozen.clone())
+            else:
+                self.R_frozen = None
+                
+            if R_trainable is not None:
+                self.register_parameter('R_trainable', nn.Parameter(R_trainable.clone()))
+            else:
+                self.R_trainable = None
         else:
             self.R_frozen = None
-            
-        if R_trainable is not None:
-            self.register_parameter('R_trainable', nn.Parameter(R_trainable.clone()))
-        else:
             self.R_trainable = None
             
         # Neural Network component
@@ -114,18 +152,56 @@ class NeuralNetworkLyapunov(nn.Module):
                 if isinstance(l, nn.Linear):
                     torch.nn.init.kaiming_uniform_(l.weight, nonlinearity="relu")
             
-            # For all quadratic_times_* modes, zero-init the last linear layer
-            # so that NN(x) = 0 at init → multiplier = 1 → V = x^T P x exactly.
-            if V_psd_form.startswith("quadratic_times_"):
+            # Zero-init the last linear layer for forms that require V = x^T P x at init.
+            # quadratic_times_*: NN(x)=0 → multiplier=1 → V = x^T P x exactly.
+            # quadratic_plus_sq:  NN(x)=0 → residual=0  → V = x^T P x exactly.
+            if (V_psd_form.startswith("quadratic_times_")
+                    or V_psd_form in ("quadratic_plus_sq", "quadratic_plus_abs")):
                 last_linear = layers[-1]  # last element is always Linear
                 nn.init.zeros_(last_linear.weight)
                 nn.init.zeros_(last_linear.bias)
+
+            # nn_sigmoid / nn_sigmoid_c1: initialise so NN(x) ≈ −5 everywhere
+            # → V ≈ sigmoid(−5) ≈ 0.007.  Training shapes the level sets.
+            if V_psd_form in ("nn_sigmoid", "nn_sigmoid_c1"):
+                last_linear = layers[-1]
+                nn.init.zeros_(last_linear.weight)
+                last_linear.bias.data.fill_(-5.0)
+
+            # nn_sigmoid_abs & quadratic_plus_sigmoid: keep small random init
+            # for last layer so |σ(NN(x)) - σ(NN(x*))| ≈ small nonzero
+            # → gradient flows through abs().  Zero-init gives dead gradient
+            # since ∂|z|/∂z = sign(0) = 0 when z = |σ(0) - σ(0)| = 0.
+            # std=0.01 keeps V ≈ pure quadratic base at init while allowing learning.
+            if V_psd_form == "quadratic_plus_sigmoid":
+                last_linear = layers[-1]
+                nn.init.normal_(last_linear.weight, std=0.01)
+                nn.init.normal_(last_linear.bias, std=0.01)
 
             self.net = nn.Sequential(*layers)
         else:
             self.net = None
             
         self.nominal = nominal
+
+    @property
+    def nn_scale(self):
+        if self._learnable_nn_scale:
+            raw = torch.exp(self._log_nn_scale)
+            # For quadratic_times_tanh, α must stay in (0,1) for positivity:
+            # V = x'Px · (1 + α·tanh(NN)) > 0  requires α < 1.
+            if self.V_psd_form == "quadratic_times_tanh":
+                raw = torch.clamp(raw, max=0.999)
+            return raw
+        return self._nn_scale_fixed
+
+    def get_nn_scale_value(self) -> float:
+        if self._learnable_nn_scale:
+            val = float(self._log_nn_scale.exp().item())
+            if self.V_psd_form == "quadratic_times_tanh":
+                val = min(val, 0.999)
+            return val
+        return self._nn_scale_fixed
 
     def _network_output(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_nonlinear and self.net is not None and len(self.net) > 0:
@@ -136,6 +212,10 @@ class NeuralNetworkLyapunov(nn.Module):
             return torch.zeros((*x.shape[:-1], 1), device=x.device, dtype=x.dtype)
 
     def _V_psd_output(self, x: torch.Tensor):
+        # Pure-NN forms have no quadratic/L1 base term (except quadratic_plus_sigmoid).
+        if self._is_pure_nn and self.V_psd_form != "quadratic_plus_sigmoid":
+            return torch.zeros((*x.shape[:-1], 1), device=x.device, dtype=x.dtype)
+
         x_diff = x - self.goal_state
         
         # Construct the effective P matrix or L1 coefficients
@@ -145,15 +225,19 @@ class NeuralNetworkLyapunov(nn.Module):
         v_psd = torch.zeros((*x.shape[:-1], 1), device=x.device, dtype=x.dtype)
         
         # Base epsilon term for strictly positive definiteness
-        # All quadratic_times_* forms share the same x'Px base.
+        # All quadratic_times_* forms and quadratic_plus_sq share the same x'Px base.
         _is_quad = (self.V_psd_form == "quadratic"
-                    or self.V_psd_form.startswith("quadratic_times_"))
+                    or self.V_psd_form.startswith("quadratic_times_")
+                    or self.V_psd_form in ("quadratic_plus_sq", "quadratic_plus_abs",
+                                           "quadratic_plus_sigmoid"))
         if self.eps > 0 and _is_quad:
             v_psd += self.eps * torch.sum(x_diff ** 2, dim=-1, keepdim=True)
             
         def compute_term(R_mat, form):
             if R_mat is None: return 0
-            if form == "quadratic" or form.startswith("quadratic_times_"):
+            if (form == "quadratic" or form.startswith("quadratic_times_")
+                    or form in ("quadratic_plus_sq", "quadratic_plus_abs",
+                                "quadratic_plus_sigmoid")):
                 return torch.sum((x_diff @ R_mat.T) ** 2, dim=-1, keepdim=True)
             elif form == "L1":
                 # (eps*I + R^TR)x handled differently here for L1
@@ -170,6 +254,38 @@ class NeuralNetworkLyapunov(nn.Module):
     def forward(self, x):
         V_nominal = 0 if self.nominal is None else self.nominal(x)
 
+        # --- Pure-NN forms: the NN alone defines V(x) ---
+        if self.V_psd_form == "nn_sigmoid":
+            # V(x) = sigmoid(NN(x)).  Always in (0,1).
+            # V(x*) ≈ 0 (learned during training; init bias = −5).
+            raw = self.net(x)
+            return V_nominal + torch.sigmoid(raw)
+
+        if self.V_psd_form == "nn_sigmoid_c1":
+            # Same as nn_sigmoid but designed for c₁-exclusion training.
+            raw = self.net(x)
+            return V_nominal + torch.sigmoid(raw)
+
+        if self.V_psd_form == "nn_sigmoid_abs":
+            # V(x) = α · |σ(NN(x)) − σ(NN(x*))|
+            # Structural V(x*)=0 via absolute sigmoid difference.
+            raw = self.net(x)
+            raw_star = self.net(self.goal_state)
+            return V_nominal + self.nn_scale * torch.abs(
+                torch.sigmoid(raw) - torch.sigmoid(raw_star)
+            )
+
+        if self.V_psd_form == "nn_abs":
+            # V(x) = α · |NN(x) − NN(x*)|.  V(x*)=0 exactly, V≥0.
+            network_output = self._network_output(x)
+            return V_nominal + self.nn_scale * torch.abs(network_output)
+
+        if self.V_psd_form == "nn_sq":
+            # V(x) = α · (NN(x) − NN(x*))².  V(x*)=0 exactly, V≥0, smooth.
+            network_output = self._network_output(x)
+            return V_nominal + self.nn_scale * network_output ** 2
+
+        # --- Quadratic-based forms ---
         network_output = self._network_output(x)
         V_psd_output = self._V_psd_output(x)
 
@@ -179,6 +295,30 @@ class NeuralNetworkLyapunov(nn.Module):
                 return V_nominal + V_psd_output
             else:
                 return V_nominal + V_psd_output * self._compute_multiplier(network_output)
+        elif self.V_psd_form == "quadratic_plus_sq":
+            # V = x^T P x + α * (φ(x) − φ(0))²
+            # network_output is already φ(x) − φ(0) (zero-mean at init).
+            # Squaring is always ≥ 0, so V ≥ x^T P x.  No BoundMul cross-term
+            # between the quadratic and the NN → CROWN bounds stay tight.
+            sq_residual = network_output ** 2  # [batch, 1]
+            return V_nominal + V_psd_output + self.nn_scale * sq_residual
+        elif self.V_psd_form == "quadratic_plus_abs":
+            # V = x^T P x + α·|φ(x) − φ(0)|
+            # Uses torch.abs() so auto_LiRPA maps to BoundAbs for tight CROWN bounds.
+            # Always ≥ 0, so V ≥ x^T P x.
+            abs_residual = torch.abs(network_output)
+            return V_nominal + V_psd_output + self.nn_scale * abs_residual
+        elif self.V_psd_form == "quadratic_plus_sigmoid":
+            # V = x'Px + α·|σ(NN(x)) − σ(NN(x*))|
+            # Quadratic base handles near-origin; sigmoid NN adds bounded flexibility.
+            # V(x*)=0 structurally.  σ difference bounded in (-1,1), abs in [0,1).
+            if self.net is None:
+                # use_nonlinear=False: pure quadratic, no NN in the graph
+                return V_nominal + V_psd_output
+            raw = self.net(x)
+            raw_star = self.net(self.goal_state)
+            sig_diff = torch.abs(torch.sigmoid(raw) - torch.sigmoid(raw_star))
+            return V_nominal + V_psd_output + self.nn_scale * sig_diff
         elif self.absolute_output:
             return (
                 V_nominal
@@ -514,31 +654,18 @@ class LyapunovDerivativeSimpleLossWithVBox(LyapunovDerivativeSimpleLossWithV):
 # =============================================================================
 
 class DissipativityDerivativeLoss(nn.Module):
+    """Dissipativity-based derivative loss with ROA constraint.
+
+    Condition (must be ≥ 0 everywhere in the verification domain):
+        max{V(x) − ρ,  min{V(x) − V(x⁺) + s·supply,  ρ − V(x⁺)}} ≥ 0
+
+    Verification modes (set via ``verification_mode``):
+        'combined'      — max{A, min{B, C}}, used for training (default)
+        'dissipativity' — max{A, B}, single output for CROWN IBP pruning
+        'invariance'    — [C, V(x)], 2-output level-set for CROWN VNNLIB
+        'combined_tight'— max{A, clamp(V+s, ρ) − V⁺}, 3 ReLUs
     """
-    Dissipativity-based derivative loss for state feedback with ROA constraints.
-    
-    Verifies the LOCAL dissipativity condition for forward invariance:
-        V(x_{t+1}) - V(x_t) ≤ min(0, s(w, z))
-    
-    This ensures:
-        1. When s < 0: V decreases at rate bounded by s
-        2. When s ≥ 0: V still decreases (forward invariance)
-    
-    Equivalently (for verification, we want this ≥ 0):
-        V(x_t) - V(x_{t+1}) + min(0, s(w, z)) ≥ 0
-    
-    Supply rate types:
-        - Lyapunov:  s = -κV(x)           → always ≤ 0, standard Lyapunov
-        - L2-gain:   s = γ²‖w‖² - ‖z‖²   → bounded L2 gain with invariance
-        - Passivity: s = wᵀz              → passive system with invariance
-    
-    Loss structure (same as LyapunovDerivativeLoss):
-        min(loss1, loss2 + loss3)
-        - loss1: Outside ROA penalty (ρ - V(x))
-        - loss2: Dissipativity violation
-        - loss3: Box constraint violation
-    """
-    
+
     def __init__(
         self,
         dynamics: dynamical_system.DiscreteTimeSystem,
@@ -553,29 +680,24 @@ class DissipativityDerivativeLoss(nn.Module):
         hard_max: bool = True,
         loss_weights: Optional[torch.Tensor] = None,
         s_scale: float = 1.0,
+        learnable_s_scale: bool = False,
+        relu_minmax: bool = False,
+        verification_mode: str = 'combined',
+        c1_threshold: float = 0.0,
         *args,
         **kwargs
     ):
-        """
-        Args:
-            dynamics: Discrete-time dynamical system
-            controller: Neural network controller
-            lyap_nn: Neural network Lyapunov function
-            supply_rate: Supply rate object (Lyapunov, L2-gain, or Passivity)
-            box_lo, box_up: Bounding box for state invariance
-            rho_multiplier: Multiplier for sublevel set ρ
-            w_max: Disturbance bound |w| ≤ w_max. Required for L2-gain/Passivity.
-            beta: Soft-max coefficient
-            hard_max: Use hard max (True) or soft max (False)
-            loss_weights: Weights for loss components [outside_roa, dissipation, box]
-            s_scale: Scaling factor for supply rate s(w, z)
-        """
+        # Pop legacy kwargs for backward compatibility
+        relu_minmax = kwargs.pop('relu_minmax', relu_minmax)
+        verification_mode = kwargs.pop('verification_mode', verification_mode)
+        c1_multiplier = kwargs.pop('c1_multiplier', 0.0)
         super().__init__(*args, **kwargs)
+
         self.dynamics = dynamics
         self.controller = controller
         self.lyapunov = lyap_nn
         self.supply_rate = supply_rate
-        self.observer = kwargs.get('observer', None)
+        self.verification_mode = verification_mode
         self.box_lo = box_lo
         self.box_up = box_up
         self.rho_multiplier = rho_multiplier
@@ -583,194 +705,196 @@ class DissipativityDerivativeLoss(nn.Module):
         self.hard_max = hard_max
         self.x_boundary: typing.Optional[torch.Tensor] = None
         self.nx = dynamics.nx
-        self.nw = getattr(dynamics.continuous_time_system, 'nw', 1) if hasattr(dynamics, 'continuous_time_system') else 1
-        
-        # Store w_max as tensor
+        self.nw = (getattr(dynamics.continuous_time_system, 'nw', 1)
+                   if hasattr(dynamics, 'continuous_time_system') else 1)
+
         if w_max is not None:
-            if isinstance(w_max, (int, float)):
-                self.w_max = torch.tensor([w_max])
-            else:
-                self.w_max = w_max
+            self.w_max = torch.tensor([w_max]) if isinstance(w_max, (int, float)) else w_max
         else:
             self.w_max = None
-        
+
         if loss_weights is None:
             self.loss_weights = torch.tensor([1.0, 1.0, 1.0])
         else:
             assert loss_weights.shape == (3,)
-            assert torch.all(loss_weights > 0)
             self.loss_weights = loss_weights
-        
-        self.s_scale = s_scale
-        
-        # Validate configuration
+
+        # Supply-rate scaling (log-parameterised if learnable)
+        self._s_scale_learnable = learnable_s_scale
+        if learnable_s_scale:
+            self._log_s_scale = nn.Parameter(torch.log(torch.tensor(float(s_scale))))
+        else:
+            self._s_scale_fixed = float(s_scale)
+
+        # ReLU-based min/max avoids BoundReduceMin/Max crash in auto_LiRPA
+        self.relu_minmax = relu_minmax
+        if self.relu_minmax:
+            self._relu = nn.ReLU()
+
         if supply_rate.requires_disturbance:
             assert w_max is not None, "Supply rate requires disturbance bound w_max"
-    
+
+        # c₁ exclusion zone: points with V(x) < c₁ are trivially safe.
+        # This allows V(x*) > 0 forms like nn_sigmoid_c1 to work.
+        # If c1_threshold > 0, use it as a fixed value.
+        # If c1_multiplier > 0, compute c₁ = c1_multiplier * V(x*) dynamically.
+        self.c1_threshold = float(c1_threshold)
+        self._c1_multiplier = float(c1_multiplier)
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+    @property
+    def s_scale(self):
+        if self._s_scale_learnable:
+            return torch.exp(self._log_s_scale)
+        return self._s_scale_fixed
+
+    def get_s_scale_value(self) -> float:
+        if self._s_scale_learnable:
+            return float(self._log_s_scale.exp().item())
+        return self._s_scale_fixed
+
     def get_rho(self):
-        """Compute ROA sublevel set value ρ."""
+        if hasattr(self, '_fixed_rho') and self._fixed_rho is not None:
+            return torch.tensor(self._fixed_rho, dtype=torch.float32)
         if self.x_boundary is None:
             return torch.tensor(0.0)
-        rho_boundary = self.lyapunov(self.x_boundary).min()
-        rho = self.rho_multiplier * rho_boundary
-        return rho
-    
+        return self.rho_multiplier * self.lyapunov(self.x_boundary).min()
+
+    @property
+    def kappa(self):
+        if isinstance(self.supply_rate, supply_rate_module.LyapunovSupplyRate):
+            return self.supply_rate.kappa
+        return 0.0
+
+    @property
+    def requires_disturbance(self):
+        return self.supply_rate.requires_disturbance
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
     def _sample_disturbance(self, batch_size: int, device: torch.device) -> Optional[torch.Tensor]:
-        """Sample disturbance uniformly in [-w_max, w_max]."""
         if not self.supply_rate.requires_disturbance or self.w_max is None:
             return None
         w_max = self.w_max.to(device)
-        w = (torch.rand(batch_size, self.nw, device=device) - 0.5) * 2 * w_max
-        return w
-    
+        return (torch.rand(batch_size, self.nw, device=device) - 0.5) * 2 * w_max
+
     def forward(self, x: torch.Tensor, w: Optional[torch.Tensor] = None, save_new_x: bool = False):
-        """
-        Compute dissipativity loss based on the condition:
-        
-        max{V(x) - c - ε, min{-V(F(x,u)) + V(x) + s(w,z), -V(F(x,u)) + c}} ≥ 0
-        """
-        # Handle joint [x, w] input if w is not provided explicitly
+        # Dynamic c₁ update: c₁ = multiplier × V(x*), clamped below ρ
+        if self._c1_multiplier > 0:
+            with torch.no_grad():
+                gs = self.lyapunov.goal_state
+                if gs.dim() == 1:
+                    gs = gs.unsqueeze(0)
+                V_star = self.lyapunov(gs).item()
+                c1_raw = self._c1_multiplier * V_star
+                # Clamp c₁ strictly below ρ to prevent vacuous verification.
+                # When c₁ ≥ ρ, every point in the ROA trivially satisfies
+                # c₁ - V > 0, giving zero gradient signal to training.
+                rho = float(self.get_rho())
+                if rho > V_star:
+                    # Place c₁ at most 30% of the way from V(x*) to ρ
+                    c1_max = V_star + 0.3 * (rho - V_star)
+                    self.c1_threshold = min(c1_raw, c1_max)
+                else:
+                    # ρ ≤ V(x*) or ρ=0: keep c₁ to protect equilibrium.
+                    # Verification is vacuous but V doesn't collapse.
+                    self.c1_threshold = c1_raw
+
+        # Split joint [x, w] input if needed
         if w is None and x.shape[1] == self.nx + self.nw:
-            w = x[:, self.nx:]
-            x = x[:, :self.nx]
-            
-        batch_size = x.shape[0]
-        device = x.device
-        
-        # Sample disturbance if required but not provided
+            w, x = x[:, self.nx:], x[:, :self.nx]
         if w is None and self.supply_rate.requires_disturbance:
-            w = self._sample_disturbance(batch_size, device)
-        
-        # Determine if we are doing output feedback (DOF) or state feedback
-        is_dof = self.observer is not None
-        
-        if is_dof:
-            # DOF case: x is actually augmented state [state, error]
-            # Split augmented state
-            # x input here is actually xe
-            xe = x
-            state_dim = self.dynamics.nx # Should be same as self.nx
-            x_state = xe[:, :state_dim]
-            e_error = xe[:, state_dim:]
-            
-            # Reconstruct estimated state z = x - e
-            z_est = x_state - e_error
-            
-            # Controller acts on estimated state z
-            u = self.controller(z_est)
-            
-            # True state update
-            new_x_state = self.dynamics.forward(x_state, u, w)
-            
-            # Observer update
-            # Get measurement y (from true x)
-            y = self.dynamics.observation(x_state)
-            
-            # Observer estimates next z based on current z, u, and y
-            new_z_est = self.observer(z_est, u, y)
-            
-            # Error update: new_e = new_x - new_z
-            new_e_error = new_x_state - new_z_est
-            
-            # Combine into new augmented state
-            new_x = torch.cat((new_x_state, new_e_error), dim=1)
-            
-            # For supply rate calculation, we need true state output
-            x_for_output = x_state
-            
-        else:
-            # State feedback case
-            x_for_output = x
-            
-            # Control input
-            u = self.controller(x)
-        
-            # Next state (with disturbance if provided)
-            new_x = self.dynamics.forward(x, u, w)
+            w = self._sample_disturbance(x.shape[0], x.device)
+
+        # Dynamics step
+        u = self.controller(x)
+        new_x = self.dynamics.forward(x, u, w)
         if save_new_x:
             self.new_x = new_x
-        
+
         # Lyapunov values
         V_x = self.lyapunov(x)
         V_next = self.lyapunov(new_x)
         self.last_lyapunov_x = V_x.detach()
-        
-        # Performance output z (for L2-gain/Passivity)
-        z = None
-        if self.supply_rate.requires_output:
-            if is_dof:
-                 # Use observer output function if available, otherwise dynamics output
-                 if hasattr(self.observer, 'h'):
-                     z = self.observer.h(x_for_output)
-                 else:
-                     z = self.dynamics.output(x_for_output, u)
-            else:
-                z = self.dynamics.output(x_for_output, u)
-        
-        # Compute supply rate s(w, z)
+
+        # Supply rate
+        z = self.dynamics.output(x, u) if self.supply_rate.requires_output else None
         supply = self.supply_rate(w, z, V_x)
-        
-        # Get c = ρ (ROA sublevel set value)
+
+        # Core terms
         c = self.get_rho()
-        
-        # Implement: max{V(x) - c - ε, min{-V(x_next) + V(x) + s, -V(x_next) + c}} ≥ 0
-        # Using ε = 0 (margin is implicit in rho_multiplier)
-        
-        # Term 1: V(x) - c (outside ROA condition)
-        term1 = V_x - c
-        
-        # Term 2a: -V(x_next) + V(x) + alpha * s = V(x) - V(x_next) + alpha * s (dissipativity)
-        term2a = V_x - V_next + self.s_scale * supply
-        
-        # Term 2b: -V(x_next) + c = c - V(x_next) (forward invariance into ROA)
-        term2b = c - V_next
-        
-        # Term 2: min{term2a, term2b}
-        term2 = torch.min(torch.cat((term2a, term2b), dim=-1), dim=-1, keepdim=True).values
-        
-        # Final: max{term1, term2}
-        if self.hard_max:
-            result = torch.max(torch.cat((term1, term2), dim=-1), dim=-1, keepdim=True).values
+        term1 = V_x - c                                  # outside-ROA
+        term2a = V_x - V_next + self.s_scale * supply    # dissipativity
+        term2b = c - V_next                               # forward invariance
+
+        return self._combine(term1, term2a, term2b, V_x)
+
+    def _combine(self, term1, term2a, term2b, V_x):
+        """Combine terms according to ``self.verification_mode``.
+
+        With c₁ > 0, the verified condition becomes:
+            max{V-ρ, min{decrease, invariance}, c₁-V} ≥ 0
+        The c₁-V clause makes points with V(x) < c₁ trivially safe
+        (the disjunction V ≤ c₁ holds).
+        """
+        mode = self.verification_mode
+
+        # Optional c₁ exclusion term: c₁ - V > 0 when V < c₁ → safe
+        term_c1 = None
+        if self.c1_threshold > 0:
+            term_c1 = self.c1_threshold - V_x
+
+        if mode == 'invariance':
+            return torch.cat([term2b, V_x], dim=-1)
+
+        if mode == 'dissipativity':
+            out = self._relu_max(term1, term2a)
+            if term_c1 is not None:
+                out = self._relu_max(out, term_c1)
+            return out
+
+        if mode == 'combined_tight':
+            if self.relu_minmax:
+                clamped = term2a - self._relu(term2a - term2b)  # min(term2a, term2b)
+                out = self._relu_max(term1, clamped)
+                if term_c1 is not None:
+                    out = self._relu_max(out, term_c1)
+                return out
+            else:
+                clamped = torch.min(torch.cat((term2a, term2b), dim=-1), dim=-1, keepdim=True).values
+                terms_outer = [term1, clamped]
+                if term_c1 is not None:
+                    terms_outer.append(term_c1)
+                return torch.max(torch.cat(terms_outer, dim=-1), dim=-1, keepdim=True).values
+
+        # 'combined' mode (training default):
+        # max{term1, min{term2a, term2b}[, term_c1]}
+        if self.relu_minmax:
+            d2 = term2a - term2b
+            term2 = 0.5 * (term2a + term2b - self._relu(d2) - self._relu(-d2))
+            d1 = term1 - term2
+            out = 0.5 * (term1 + term2 + self._relu(d1) + self._relu(-d1))
+            if term_c1 is not None:
+                out = self._relu_max(out, term_c1)
+            return out
         else:
-            result = soft_max(torch.cat((term1, term2), dim=-1), self.beta)
-        
-        # Return result (should be ≥ 0 for valid condition)
-        # For training, we want to minimize violations, so return as-is
-        # (negative values indicate violations)
-        return result
-    
-    @property
-    def kappa(self):
-        """For compatibility: extract kappa if using Lyapunov supply rate."""
-        if isinstance(self.supply_rate, supply_rate_module.LyapunovSupplyRate):
-            return self.supply_rate.kappa
-        return 0.0
-    
-    @property
-    def requires_disturbance(self):
-        """Whether this loss requires disturbance input w for training/verification."""
-        return self.supply_rate.requires_disturbance
+            term2 = torch.min(torch.cat((term2a, term2b), dim=-1), dim=-1, keepdim=True).values
+            terms_outer = [term1, term2]
+            if term_c1 is not None:
+                terms_outer.append(term_c1)
+            if self.hard_max:
+                return torch.max(torch.cat(terms_outer, dim=-1), dim=-1, keepdim=True).values
+            return soft_max(torch.cat(terms_outer, dim=-1), self.beta)
 
-
-class DissipativityDerivativeLossWithV(DissipativityDerivativeLoss):
-    """
-    Dissipativity loss with V(x) as second output for level set verification.
-    """
-    
-    def forward(self, x: torch.Tensor, w: Optional[torch.Tensor] = None, *args, **kwargs):
-        loss = super().forward(x, w, *args, **kwargs)
-        return torch.cat((loss, self.last_lyapunov_x), dim=1)
-
-
-class DissipativityDerivativeLossWithVBox(DissipativityDerivativeLossWithV):
-    """
-    Additionally output x_next for bounding box verification.
-    """
-    
-    def forward(self, x: torch.Tensor, w: Optional[torch.Tensor] = None, *args, **kwargs):
-        loss_and_V = super().forward(x, w, save_new_x=True, *args, **kwargs)
-        return torch.cat((loss_and_V, self.new_x), dim=1)
-    
+    def _relu_max(self, a, b):
+        """Element-wise max(a, b) using ReLU or torch.max."""
+        if self.relu_minmax:
+            d = a - b
+            return 0.5 * (a + b + self._relu(d) + self._relu(-d))
+        return torch.max(torch.cat((a, b), dim=-1), dim=-1, keepdim=True).values
 
 
 
@@ -1001,190 +1125,6 @@ class LyapunovDerivativeDOFLossWithVBox(LyapunovDerivativeDOFLossWithV):
         return torch.cat((loss_and_v, self.new_xe), dim=1)
 
 
-class LyapunovContinuousTimeDerivativeLoss(nn.Module):
-    """
-    Lyapunov derivative loss for dynamic output feedback.
-    Compute -κ*V - ∂V/∂ ẋ >= 0
-    """
-
-    def __init__(
-        self,
-        continuous_time_system,
-        controller: controllers.NeuralNetworkController,
-        lyap_nn: NeuralNetworkQuadraticLyapunov,
-        kappa=0.1,
-        beta: float = 100,
-        hard_max: bool = True,
-        *args,
-        **kwargs
-    ):
-        super().__init__(*args, **kwargs)
-        self.continuous_time_system = continuous_time_system
-        self.controller = controller
-        self.lyapunov = lyap_nn
-        self.kappa = kappa
-        self.nx = continuous_time_system.nx
-        self.nq = continuous_time_system.nq
-        self.x_boundary: typing.Optional[torch.Tensor] = None
-        self.beta = beta
-        self.hard_max = hard_max
-
-    def forward(self, x):
-        # Run the system by one step with dt.
-        u = self.controller.forward(x)
-        v_dot = self.continuous_time_system.forward(x, u)
-        x_dot = torch.cat((x[:, self.nq :], v_dot), dim=1)
-        dVdx = self.lyapunov.dVdx(x)
-        V_dot = torch.sum(dVdx * x_dot, dim=-1, keepdim=True)
-        lyapunov_x = self.lyapunov(x)
-        self.last_lyapunov_x = lyapunov_x.detach()
-        loss = -self.kappa * lyapunov_x - V_dot
-        if self.x_boundary is not None:
-            q = torch.cat(
-                (loss, lyapunov_x - self.lyapunov(self.x_boundary).min()), dim=-1
-            )
-            if self.hard_max:
-                return torch.max(q, dim=-1, keepdim=True).values
-            else:
-                return soft_max(q, self.beta)
-
-        else:
-            return loss
-
-
-class LyapunovContinuousTimeDerivativeLossWithV(LyapunovContinuousTimeDerivativeLoss):
-    """
-    The same as LyapunovDerivativeLoss, but with V(x) as the second output.
-    Used for verification with level set.
-    TODO: make it a template class to also support LyapunovDerivativeDOFLoss.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        assert self.x_boundary is None
-
-    def forward(self, *args, **kwargs):
-        loss = super().forward(*args, **kwargs)
-        # Output should be [N, 2] where N is the batch size.
-        return torch.cat((loss, self.last_lyapunov_x), dim=1)
-
-
-class LyapunovContinuousTimeDerivativeDOFLoss(nn.Module):
-    """
-    Lyapunov derivative loss for dynamic output feedback.
-    Compute -κ*V - ∂V/∂ ẋ >= 0
-    """
-
-    def __init__(
-        self,
-        continuous_time_system,
-        observer,
-        controller: controllers.NeuralNetworkController,
-        lyap_nn: NeuralNetworkQuadraticLyapunov,
-        kappa=0.1,
-        beta: float = 100,
-        hard_max: bool = True,
-        *args,
-        **kwargs
-    ):
-        super().__init__(*args, **kwargs)
-        self.continuous_time_system = continuous_time_system
-        self.observer = observer
-        self.controller = controller
-        self.lyapunov = lyap_nn
-        self.kappa = kappa
-        self.nx = continuous_time_system.nx
-        self.x_boundary: typing.Optional[torch.Tensor] = None
-        self.beta = beta
-        self.hard_max = hard_max
-
-    def forward(self, xe):
-        # Run the system by one step with dt.
-        x = xe[:, : self.nx]
-        e = xe[:, self.nx :]
-        z = x - e
-        y = self.observer.h(x)
-        # u = self.controller.forward(z)
-        ey = y - self.observer.h(z)
-        u = self.controller.forward(torch.cat((z, ey), dim=1))
-        v_dot = self.continuous_time_system.forward(x, u)
-        x_dot = torch.cat((x[:, self.nq :], v_dot), dim=1)
-        z_dot = self.observer.forward(z, u, y)
-        e_dot = x_dot - z_dot
-        xi_dot = torch.cat((x_dot, e_dot), dim=1)
-        dVdxi = self.lyapunov.dVdx(xe)
-        V_dot = torch.sum(dVdxi * xi_dot, dim=-1, keepdim=True)
-        lyapunov_x = self.lyapunov(xe)
-        loss = -self.kappa * lyapunov_x - V_dot
-        self.last_lyapunov_x = lyapunov_x.detach()
-        if self.x_boundary is not None:
-            q = torch.cat(
-                (loss, lyapunov_x - self.lyapunov(self.x_boundary).min()), dim=-1
-            )
-            if self.hard_max:
-                return torch.max(q, dim=-1, keepdim=True).values
-            else:
-                return soft_max(q, self.beta)
-
-        else:
-            return loss
-
-
-class CLFDerivativeLoss(nn.Module):
-    """
-    Lyapunov derivative loss for dynamic output feedback.
-    Compute -κ*V - ∂V/∂ ẋ >= 0
-    """
-
-    def __init__(
-        self,
-        continuous_time_system,
-        lyap_nn,
-        u_abs_box: torch.Tensor,
-        kappa=0.1,
-        beta: float = 100,
-        hard_max: bool = True,
-        *args,
-        **kwargs
-    ):
-        super().__init__(*args, **kwargs)
-        self.continuous_time_system = continuous_time_system
-        self.lyapunov = lyap_nn
-        self.u_abs_box = u_abs_box
-        self.kappa = kappa
-        self.nx = continuous_time_system.nx
-        self.nq = continuous_time_system.nq
-        self.x_boundary: typing.Optional[torch.Tensor] = None
-        self.beta = beta
-        self.hard_max = hard_max
-
-    def forward(self, x):
-        # Run the system by one step with dt.
-        f1 = self.continuous_time_system.f1(x)
-        f2 = self.continuous_time_system.f2(x)
-        dVdx = self.lyapunov.dVdx(x)
-        Lf1 = torch.sum(dVdx * f1, dim=-1, keepdim=True)
-        Lf2 = torch.sum(
-            torch.abs(dVdx.unsqueeze(1) @ f2).squeeze() * self.u_abs_box,
-            dim=-1,
-            keepdim=True,
-        )
-        V_dot = Lf1 - Lf2
-        lyapunov_x = self.lyapunov(x)
-        self.last_lyapunov_x = lyapunov_x.detach()
-        loss = -self.kappa * lyapunov_x - V_dot
-        if self.x_boundary is not None:
-            q = torch.cat(
-                (loss, lyapunov_x - self.lyapunov(self.x_boundary).min()), dim=-1
-            )
-            if self.hard_max:
-                return torch.max(q, dim=-1, keepdim=True).values
-            else:
-                return soft_max(q, self.beta)
-
-        else:
-            return loss
-
 
 class ObserverLoss(nn.Module):
     """
@@ -1220,20 +1160,5 @@ class ObserverLoss(nn.Module):
         x_next = self.dynamics.forward(x, u)
         z_next = self.observer.forward(z, u, y)
         loss = torch.norm(x_next - z_next, p=2, dim=1)
-        # z_ekf = self.ekf_observer.forward(z, u, y)
-        # loss = torch.norm(z_ekf - z_next, p=2, dim=1)
         return loss.unsqueeze(1)
 
-
-class LyapunovLowerBoundLoss:
-    """
-    We want the condition V(x) >= ρ
-    We compute V(x) - ρ
-    """
-
-    def __init__(self, lyap: NeuralNetworkLyapunov, rho_roa: float):
-        self.lyapunov = lyap
-        self.rho_roa = rho_roa
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.lyapunov(x) - self.rho_roa

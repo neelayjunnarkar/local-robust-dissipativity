@@ -26,22 +26,31 @@ def generate_preamble(out, state_dim, args):
         f"; Generated at {time.ctime()} on {socket.gethostname()} by {user}\n"
     )
     out.write(f'; Generation command: \n; {" ".join(sys.argv)}\n\n')
-    out.write("; Input variables (states).\n")
+    extra_dim = len(getattr(args, 'extra_input_lower', []))
+    total_input_dim = state_dim + extra_dim
+    out.write("; Input variables.\n")
 
-    for i in range(state_dim):
+    for i in range(total_input_dim):
         out.write(f"(declare-const X_{i} Real)\n")
 
+    n_outputs = getattr(args, 'disjunctive_outputs', 1)
     if abs(args.value_levelset) > 1e-10:
         out.write(
             "\n; Output variables (Lyapunov condition, and Lyapunov function value).\n"
         )
+    elif n_outputs > 1:
+        out.write(
+            "\n; Output variables (disjunctive Lyapunov conditions).\n"
+        )
     else:
         out.write("\n; Output variables (Lyapunov condition).\n")
-    out.write("(declare-const Y_0 Real)\n")
+    for i in range(n_outputs):
+        out.write(f"(declare-const Y_{i} Real)\n")
     if abs(args.value_levelset) >= 1e-10:
-        out.write("(declare-const Y_1 Real)\n")
+        if n_outputs < 2:
+            out.write("(declare-const Y_1 Real)\n")
         if not args.no_check_x_next:
-            for i in range(2, 2 + state_dim):
+            for i in range(max(2, n_outputs), max(2, n_outputs) + state_dim):
                 out.write(f"(declare-const Y_{i} Real)\n")
     else:
         assert args.no_check_x_next
@@ -57,7 +66,20 @@ def generate_limits(out, lower_limit, upper_limit):
         out.write(f"(assert (>= X_{i} {l}))\n\n")
 
 
+def generate_extra_input_limits(out, state_dim, extra_lower, extra_upper):
+    """Write bounds for extra (non-state) input dims (not affected by hole)."""
+    if not extra_lower:
+        return
+    out.write("; Extra input constraints (e.g., disturbance).\n\n")
+    for j, (l, u) in enumerate(zip(extra_lower, extra_upper)):
+        dim_idx = state_dim + j
+        out.write(f"; Extra input {j} (X_{dim_idx}).\n")
+        out.write(f"(assert (<= X_{dim_idx} {u}))\n")
+        out.write(f"(assert (>= X_{dim_idx} {l}))\n\n")
+
+
 def generate_specs(out, args, lower_limit, upper_limit):
+    n_outputs = getattr(args, 'disjunctive_outputs', 1)
     if abs(args.value_levelset) > 1e-10:
         out.write("; Verifying Lyapunov condition (output 0) holds (positive), and\n")
         out.write("; Lyapunov function (output 1) is less than the level set value.\n")
@@ -73,6 +95,14 @@ def generate_specs(out, args, lower_limit, upper_limit):
         else:
             out.write(f"(assert (<= Y_0 -{args.tolerance}))\n")
         out.write(f"(assert (<= Y_1 {args.value_levelset}))\n")
+    elif n_outputs > 1:
+        # Disjunctive safety: at least one of Y_0, ..., Y_{n-1} must be >= 0.
+        # Unsafe (counterexample) requires ALL outputs to be negative simultaneously.
+        # Multiple separate asserts encode conjunctive unsafe in VNNLIB.
+        out.write("; Disjunctive Lyapunov conditions: at least one output must be non-negative.\n")
+        out.write("; (Conjunctive unsafe: counterexample needs ALL outputs negative.)\n")
+        for i in range(n_outputs):
+            out.write(f"(assert (<= Y_{i} -{args.tolerance}))\n")
     else:
         out.write("; Verifying Lyapunov condition (output 0) holds (positive).\n")
         out.write(f"(assert (<= Y_0 -{args.tolerance}))\n")
@@ -161,12 +191,34 @@ def main():
         action="store_true",
         help="Only check if x_next is within the bounding box."
     )
+    parser.add_argument(
+        "--extra_input_lower",
+        type=float,
+        nargs="*",
+        default=[],
+        help="Lower bounds for extra (non-state) input dimensions (e.g., disturbance w). Not affected by hole.",
+    )
+    parser.add_argument(
+        "--extra_input_upper",
+        type=float,
+        nargs="*",
+        default=[],
+        help="Upper bounds for extra (non-state) input dimensions.",
+    )
+    parser.add_argument(
+        "--disjunctive_outputs",
+        type=int,
+        default=1,
+        help="Number of model outputs for disjunctive safety (default 1 = single output).",
+    )
 
     args = parser.parse_args()
-    assert args.hole_size >= 0 and args.hole_size <= 0.2
+    assert args.hole_size >= 0 and args.hole_size < 1.0
     assert len(args.lower_limit) == len(args.upper_limit)
     if args.check_x_next_only:
         args.no_check_x_next = False
+    assert len(args.extra_input_lower) == len(args.extra_input_upper), \
+        "--extra_input_lower and --extra_input_upper must have the same length"
     state_dim = len(args.lower_limit)
 
     # Obtain the number of regions (subproblems) to verify.
@@ -188,6 +240,7 @@ def main():
             )
             generate_preamble(out, state_dim, args)
             generate_limits(out, lower_limit, upper_limit)
+            generate_extra_input_limits(out, state_dim, args.extra_input_lower, args.extra_input_upper)
             generate_specs(out, args, lower_limit, upper_limit)
     generate_csv(num_regions, args, relpath=args.relative_vnnlib_path)
 

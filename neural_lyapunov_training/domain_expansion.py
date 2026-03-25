@@ -174,7 +174,7 @@ def update_domain_from_trajectories(
     max_growth: float = 2.0,
     hard_lower: Optional[torch.Tensor] = None,
     hard_upper: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, int]:
+) -> Tuple[torch.Tensor, torch.Tensor, int, bool]:
     """
     Expand training domain based on converging closed-loop trajectories.
 
@@ -207,7 +207,7 @@ def update_domain_from_trajectories(
 
     if x0.shape[0] == 0:
         logger.info("Domain expansion: no candidates near ROA boundary")
-        return lower_limit, upper_limit, 0
+        return lower_limit, upper_limit, 0, False
 
     # Compute probe box extents for logging
     center = (upper_limit + lower_limit) / 2.0
@@ -238,7 +238,7 @@ def update_domain_from_trajectories(
 
     if num_converged == 0 or num_converged <= 0.01 * x0.shape[0]:
         logger.info(f"Domain expansion: only {num_converged}/{x0.shape[0]} converged (need >1%)")
-        return lower_limit, upper_limit, 0
+        return lower_limit, upper_limit, 0, False
 
     conv_ratio = num_converged / x0.shape[0]
 
@@ -264,11 +264,11 @@ def update_domain_from_trajectories(
     new_lower = torch.minimum(new_lower, lower_limit)
     new_upper = torch.maximum(new_upper, upper_limit)
 
-    grew = not (torch.allclose(new_lower, lower_limit) and torch.allclose(new_upper, upper_limit))
+    grew = not (torch.allclose(new_lower, lower_limit, atol=1e-3) and torch.allclose(new_upper, upper_limit, atol=1e-3))
     logger.info(
         f"Domain expansion: {num_converged}/{x0.shape[0]} converged ({conv_ratio:.1%}), "
         f"{'GREW' if grew else 'no change'} → "
         f"[{new_lower.tolist()}] to [{new_upper.tolist()}]"
     )
 
-    return new_lower, new_upper, num_converged
+    return new_lower, new_upper, num_converged, grew
