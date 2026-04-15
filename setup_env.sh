@@ -1,14 +1,26 @@
 #!/bin/bash
 # Activation script for Lyapunov Neural Control environment
 
-# Activate conda environment
-source $(conda info --base)/etc/profile.d/conda.sh
-conda activate lnc
+set -e
 
-# Set up Python path for verification
-export PYTHONPATH="${PYTHONPATH}:$(pwd):$(pwd)/alpha-beta-CROWN:$(pwd)/alpha-beta-CROWN/complete_verifier"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "✓ Conda environment 'lnc' activated"
+# Activate conda environment unless one is already active.
+source "$(conda info --base)/etc/profile.d/conda.sh"
+if [[ -n "${CONDA_DEFAULT_ENV:-}" ]]; then
+	active_env="$CONDA_DEFAULT_ENV"
+elif [[ -n "${LNC_ENV_NAME:-}" ]]; then
+	conda activate "$LNC_ENV_NAME"
+	active_env="$LNC_ENV_NAME"
+else
+	conda activate lnc
+	active_env="lnc"
+fi
+
+# Set up Python path for verification.
+export PYTHONPATH="${repo_root}:${repo_root}/alpha-beta-CROWN:${repo_root}/alpha-beta-CROWN/auto_LiRPA:${repo_root}/alpha-beta-CROWN/complete_verifier${PYTHONPATH:+:${PYTHONPATH}}"
+
+echo "✓ Conda environment '$active_env' ready"
 echo "✓ PYTHONPATH configured for verification"
 echo ""
 echo "You can now run:"

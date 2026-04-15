@@ -61,6 +61,7 @@ class NeuralNetworkLyapunov(nn.Module):
         use_nonlinear: bool = True,
         nn_scale: float = 0.5,
         learnable_nn_scale: bool = False,
+        R_rows: typing.Optional[int] = None,
         *args,
         **kwargs
     ):
@@ -107,7 +108,14 @@ class NeuralNetworkLyapunov(nn.Module):
             Must be in (0,1) for that form. Also used as α in "quadratic_plus_sq",
             "quadratic_plus_abs", "nn_abs", "nn_sq".
             Ignored for "quadratic_times_exp" and "nn_sigmoid".
+          R_rows: Backward-compatible alias for constructing a trainable R matrix
+            when older call sites specify only its row count.
         """
+        has_quadratic_base = (V_psd_form not in self._PURE_NN_FORMS) or V_psd_form == "quadratic_plus_sigmoid"
+        legacy_r_rows_mode = has_quadratic_base and R_rows is not None and R_trainable is None and R_frozen is None
+        if legacy_r_rows_mode:
+            R_trainable = torch.rand((R_rows, x_dim)) - 0.5
+
         super().__init__(*args, **kwargs)
         self.goal_state = goal_state
         self.x_dim = x_dim
@@ -124,7 +132,9 @@ class NeuralNetworkLyapunov(nn.Module):
             self._nn_scale_fixed = float(nn_scale)
         self._is_pure_nn = V_psd_form in self._PURE_NN_FORMS
         # quadratic_plus_sigmoid has R matrices despite using sigmoid NN
-        self._has_quadratic_base = (not self._is_pure_nn) or V_psd_form == "quadratic_plus_sigmoid"
+        self._has_quadratic_base = has_quadratic_base
+        self._legacy_r_rows_mode = legacy_r_rows_mode
+        self.R_rows = R_rows
         
         # Linear/Quadratic components (R matrices) — skipped for pure-NN forms (except quadratic_plus_sigmoid)
         if self._has_quadratic_base:
@@ -208,6 +218,12 @@ class NeuralNetworkLyapunov(nn.Module):
             return val
         return self._nn_scale_fixed
 
+    @property
+    def R(self):
+        if self.R_trainable is not None:
+            return self.R_trainable
+        return self.R_frozen
+
     def _network_output(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_nonlinear and self.net is not None and len(self.net) > 0:
             phi = self.net(x)
@@ -222,6 +238,11 @@ class NeuralNetworkLyapunov(nn.Module):
             return torch.zeros((*x.shape[:-1], 1), device=x.device, dtype=x.dtype)
 
         x_diff = x - self.goal_state
+
+        if self.V_psd_form == "L1" and self._legacy_r_rows_mode and self.R is not None:
+            eps_plus_RtR = self.eps * torch.eye(self.x_dim, device=x.device, dtype=x.dtype)
+            eps_plus_RtR = eps_plus_RtR + self.R.T @ self.R
+            return torch.norm(x_diff @ eps_plus_RtR.T, p=1, dim=-1, keepdim=True)
 
         _is_quad = (self.V_psd_form == "quadratic"
                     or self.V_psd_form.startswith("quadratic_times_")

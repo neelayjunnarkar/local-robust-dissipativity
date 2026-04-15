@@ -5,5 +5,6 @@ matplotlib==3.8.2
 numpy==1.26.2
 pyyaml==6.0.1
 scipy==1.11.4
+setuptools<81
 tqdm==4.66.1
 wandb==0.16.0

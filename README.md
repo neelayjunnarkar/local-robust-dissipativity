@@ -36,12 +36,15 @@ conda activate lnc
 pip install -e .
 
 # 4. Install α,β-CROWN (for formal verification)
-git clone https://github.com/Verified-Intelligence/alpha-beta-CROWN.git
+git clone --recursive https://github.com/Verified-Intelligence/alpha-beta-CROWN.git
 pip install -e alpha-beta-CROWN/auto_LiRPA
+pip install -r alpha-beta-CROWN/complete_verifier/requirements.txt
 
 # 5. Set up environment (run before every session)
 source setup_env.sh
 ```
+
+If a conda environment is already active, `setup_env.sh` keeps it. Otherwise it falls back to activating `lnc`.
 
 ## Experiments
 
