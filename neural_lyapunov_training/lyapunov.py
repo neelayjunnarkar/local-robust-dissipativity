@@ -115,8 +115,8 @@ class NeuralNetworkLyapunov(nn.Module):
         self.V_psd_form = V_psd_form
         self.eps = eps
         self.use_nonlinear = use_nonlinear
-        if V_psd_form == "quadratic_times_tanh":
-            assert 0 < nn_scale < 1, f"nn_scale must be in (0,1) for quadratic_times_tanh, got {nn_scale}"
+        if V_psd_form == "quadratic_times_tanh" and use_nonlinear:
+            assert 0 < nn_scale < 1, f"nn_scale must be in (0,1) for quadratic_times_tanh with nonlinear, got {nn_scale}"
         self._learnable_nn_scale = learnable_nn_scale
         if learnable_nn_scale:
             self._log_nn_scale = nn.Parameter(torch.log(torch.tensor(float(nn_scale))))
@@ -184,6 +184,11 @@ class NeuralNetworkLyapunov(nn.Module):
             
         self.nominal = nominal
 
+        # Cholesky factor of P = eps*I + R_frozen^T R_frozen + R_trainable^T R_trainable.
+        # When set, forward() uses the CROWN-friendly form: y = x @ L; V = sum(y*y).
+        # Precomputed via precompute_cholesky() before verification.
+        self.register_buffer('L_chol', None)
+
     @property
     def nn_scale(self):
         if self._learnable_nn_scale:
@@ -217,22 +222,26 @@ class NeuralNetworkLyapunov(nn.Module):
             return torch.zeros((*x.shape[:-1], 1), device=x.device, dtype=x.dtype)
 
         x_diff = x - self.goal_state
-        
-        # Construct the effective P matrix or L1 coefficients
-        # P = eps*I + R_frozen^T R_frozen + R_trainable^T R_trainable
-        
-        # We handle this by summing the outputs for simplicity and correctness
-        v_psd = torch.zeros((*x.shape[:-1], 1), device=x.device, dtype=x.dtype)
-        
-        # Base epsilon term for strictly positive definiteness
-        # All quadratic_times_* forms and quadratic_plus_sq share the same x'Px base.
+
         _is_quad = (self.V_psd_form == "quadratic"
                     or self.V_psd_form.startswith("quadratic_times_")
                     or self.V_psd_form in ("quadratic_plus_sq", "quadratic_plus_abs",
                                            "quadratic_plus_sigmoid"))
+
+        # CROWN-friendly Cholesky form: V_quad = ||x @ L||^2 = sum(y * y)
+        # Uses a single BoundLinear + BoundMul chain → tighter CROWN bounds
+        # than the split R_frozen / R_trainable / eps*I computation.
+        if _is_quad and self.L_chol is not None:
+            y = x_diff @ self.L_chol.to(x.device)
+            return torch.sum(torch.mul(y, y), dim=-1, keepdim=True)
+
+        # Fallback: separate R-based computation (used during training
+        # before precompute_cholesky() is called).
+        v_psd = torch.zeros((*x.shape[:-1], 1), device=x.device, dtype=x.dtype)
+
         if self.eps > 0 and _is_quad:
-            v_psd += self.eps * torch.sum(x_diff ** 2, dim=-1, keepdim=True)
-            
+            v_psd = v_psd + self.eps * torch.sum(x_diff ** 2, dim=-1, keepdim=True)
+
         def compute_term(R_mat, form):
             if R_mat is None: return 0
             if (form == "quadratic" or form.startswith("quadratic_times_")
@@ -240,15 +249,13 @@ class NeuralNetworkLyapunov(nn.Module):
                                 "quadratic_plus_sigmoid")):
                 return torch.sum((x_diff @ R_mat.T) ** 2, dim=-1, keepdim=True)
             elif form == "L1":
-                # (eps*I + R^TR)x handled differently here for L1
-                # For this configurable version, we just do |Rx|_1 for extra components
                 Rx = x_diff @ R_mat.T
                 return (torch.nn.functional.relu(Rx) + torch.nn.functional.relu(-Rx)).sum(dim=-1, keepdim=True)
             return 0
 
-        v_psd += compute_term(self.R_frozen, self.V_psd_form)
-        v_psd += compute_term(self.R_trainable, self.V_psd_form)
-        
+        v_psd = v_psd + compute_term(self.R_frozen, self.V_psd_form)
+        v_psd = v_psd + compute_term(self.R_trainable, self.V_psd_form)
+
         return v_psd
 
     def forward(self, x):
@@ -344,6 +351,38 @@ class NeuralNetworkLyapunov(nn.Module):
             return torch.exp(network_output)
         else:
             raise ValueError(f"Unknown quadratic_times_* suffix: '{suffix}'")
+
+    def precompute_cholesky(self):
+        """Precompute Cholesky factor L such that x^T P x = ||Lx||^2 = sum(y*y).
+
+        Assembles P = eps*I + R_frozen^T R_frozen + R_trainable^T R_trainable,
+        verifies symmetry, and stores L = cholesky(P).  After calling this,
+        forward() uses the compact form ``y = x @ L; sum(y * y)`` which gives
+        tighter CROWN bounds (single BoundLinear + BoundMul chain instead of
+        multiple separate quadratic terms).
+
+        Call this before formal verification (after training is done).
+        """
+        if not self._has_quadratic_base:
+            return
+
+        device = self.goal_state.device
+        P = self.eps * torch.eye(self.x_dim, device=device)
+        if self.R_frozen is not None:
+            P = P + self.R_frozen.T @ self.R_frozen
+        if self.R_trainable is not None:
+            P = P + self.R_trainable.T @ self.R_trainable
+
+        # Symmetrise (numerical safety)
+        P = (P + P.T) / 2
+
+        if not torch.allclose(P, P.T, atol=1e-6):
+            raise ValueError("Assembled P matrix is not symmetric")
+
+        try:
+            self.L_chol = torch.linalg.cholesky(P).detach()
+        except torch.linalg.LinAlgError as e:
+            raise ValueError(f"Cholesky decomposition of P failed: {e}")
 
     def _apply(self, fn):
         """Handles CPU/GPU transfer and type conversion."""
@@ -659,9 +698,16 @@ class DissipativityDerivativeLoss(nn.Module):
     Condition (must be ≥ 0 everywhere in the verification domain):
         max{V(x) − ρ,  min{V(x) − V(x⁺) + s·supply,  ρ − V(x⁺)}} ≥ 0
 
+    With IQC multiplier (Theorem 1 of main_v3.tex):
+        Robust forward invariance:  V(x⁺) − V(x) + z^T M_rfi z ≤ 0
+        Supply rate condition:      V(x⁺) − V(x) + z^T M_sr  z ≤ s(d,e)
+    where z = (v, w), v is the IQC input (e.g. ũ + w/2 for disk margin),
+    and λ > 0 scales M.
+
     Verification modes (set via ``verification_mode``):
         'combined'      — max{A, min{B, C}}, used for training (default)
         'dissipativity' — max{A, B}, single output for CROWN IBP pruning
+                          (with IQC: B = V−V⁺−λ zᵀMz + s_scale·s; use this for IQC CROWN)
         'invariance'    — [C, V(x)], 2-output level-set for CROWN VNNLIB
         'combined_tight'— max{A, clamp(V+s, ρ) − V⁺}, 3 ReLUs
     """
@@ -691,6 +737,14 @@ class DissipativityDerivativeLoss(nn.Module):
         relu_minmax = kwargs.pop('relu_minmax', relu_minmax)
         verification_mode = kwargs.pop('verification_mode', verification_mode)
         c1_multiplier = kwargs.pop('c1_multiplier', 0.0)
+        # Uncertainty transform (e.g., tanh norm-ball): maps (v, w̃) → w
+        uncertainty_transform = kwargs.pop('uncertainty_transform', None)
+        # IQC multiplier matrix M and learnable scale λ (Theorem 1)
+        iqc_M = kwargs.pop('iqc_M', None)
+        iqc_lambda_init = kwargs.pop('iqc_lambda_init', 1.0)
+        learnable_iqc_lambda = kwargs.pop('learnable_iqc_lambda', True)
+        # Function mapping (x, u, w) → z for IQC evaluation z^T M z
+        iqc_z_fn = kwargs.pop('iqc_z_fn', None)
         super().__init__(*args, **kwargs)
 
         self.dynamics = dynamics
@@ -707,6 +761,8 @@ class DissipativityDerivativeLoss(nn.Module):
         self.nx = dynamics.nx
         self.nw = (getattr(dynamics.continuous_time_system, 'nw', 1)
                    if hasattr(dynamics, 'continuous_time_system') else 1)
+
+        self.uncertainty_transform = uncertainty_transform
 
         if w_max is not None:
             self.w_max = torch.tensor([w_max]) if isinstance(w_max, (int, float)) else w_max
@@ -741,9 +797,39 @@ class DissipativityDerivativeLoss(nn.Module):
         self.c1_threshold = float(c1_threshold)
         self._c1_multiplier = float(c1_multiplier)
 
+        # IQC multiplier: M matrix and learnable λ > 0
+        self._iqc_enabled = iqc_M is not None
+        if self._iqc_enabled:
+            if isinstance(iqc_M, torch.Tensor):
+                self.register_buffer('iqc_M', iqc_M.float())
+            else:
+                self.register_buffer('iqc_M', torch.tensor(iqc_M, dtype=torch.float32))
+            self._learnable_iqc_lambda = learnable_iqc_lambda
+            if learnable_iqc_lambda:
+                self._log_iqc_lambda = nn.Parameter(
+                    torch.log(torch.tensor(float(iqc_lambda_init)))
+                )
+            else:
+                self._iqc_lambda_fixed = float(iqc_lambda_init)
+            self._iqc_z_fn = iqc_z_fn
+
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
+    @property
+    def iqc_lambda(self) -> float:
+        if not self._iqc_enabled:
+            return 0.0
+        if self._learnable_iqc_lambda:
+            return torch.exp(self._log_iqc_lambda)
+        return self._iqc_lambda_fixed
+
+    def get_iqc_lambda_value(self) -> float:
+        if not self._iqc_enabled:
+            return 0.0
+        if self._learnable_iqc_lambda:
+            return float(self._log_iqc_lambda.exp().item())
+        return self._iqc_lambda_fixed
     @property
     def s_scale(self):
         if self._s_scale_learnable:
@@ -769,15 +855,26 @@ class DissipativityDerivativeLoss(nn.Module):
         return 0.0
 
     @property
+    def _uses_uncertainty(self):
+        """Whether this loss uses uncertainty (w) in dynamics, independent of supply rate."""
+        return (self.uncertainty_transform is not None
+                or (self.w_max is not None and self.w_max.abs().sum() > 0))
+
+    @property
     def requires_disturbance(self):
-        return self.supply_rate.requires_disturbance
+        return self.supply_rate.requires_disturbance or self._uses_uncertainty
 
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
     def _sample_disturbance(self, batch_size: int, device: torch.device) -> Optional[torch.Tensor]:
-        if not self.supply_rate.requires_disturbance or self.w_max is None:
+        """Sample random disturbance (or free parameter w̃ when using transform)."""
+        if not (self.supply_rate.requires_disturbance or self._uses_uncertainty) or self.w_max is None:
             return None
+        if self.uncertainty_transform is not None:
+            # Sample w̃ in [-c̄, c̄]^nw (transform maps it to w later)
+            c_bar = self.uncertainty_transform.w_tilde_bound
+            return (torch.rand(batch_size, self.nw, device=device) - 0.5) * 2 * c_bar
         w_max = self.w_max.to(device)
         return (torch.rand(batch_size, self.nw, device=device) - 0.5) * 2 * w_max
 
@@ -806,11 +903,16 @@ class DissipativityDerivativeLoss(nn.Module):
         # Split joint [x, w] input if needed
         if w is None and x.shape[1] == self.nx + self.nw:
             w, x = x[:, self.nx:], x[:, :self.nx]
-        if w is None and self.supply_rate.requires_disturbance:
+        if w is None and (self.supply_rate.requires_disturbance or self._uses_uncertainty):
             w = self._sample_disturbance(x.shape[0], x.device)
 
         # Dynamics step
         u = self.controller(x)
+
+        # Uncertainty transform: w̃ → w = T(v, w̃) where v = u
+        if w is not None and self.uncertainty_transform is not None:
+            w = self.uncertainty_transform(u, w)
+
         new_x = self.dynamics.forward(x, u, w)
         if save_new_x:
             self.new_x = new_x
@@ -821,16 +923,61 @@ class DissipativityDerivativeLoss(nn.Module):
         self.last_lyapunov_x = V_x.detach()
 
         # Supply rate
-        z = self.dynamics.output(x, u) if self.supply_rate.requires_output else None
-        supply = self.supply_rate(w, z, V_x)
+        z_out = self.dynamics.output(x, u) if self.supply_rate.requires_output else None
+        supply = self.supply_rate(w, z_out, V_x)
 
-        # Core terms
-        c = self.get_rho()
-        term1 = V_x - c                                  # outside-ROA
-        term2a = V_x - V_next + self.s_scale * supply    # dissipativity
-        term2b = c - V_next                               # forward invariance
+        iqc_term = self._compute_iqc_term(x, u, w, V_x)
+        term1, term2a, term2b = self._compute_core_terms(
+            V_x=V_x,
+            V_next=V_next,
+            supply=supply,
+            iqc_term=iqc_term,
+        )
 
         return self._combine(term1, term2a, term2b, V_x)
+
+    def _compute_iqc_term(
+        self,
+        x: torch.Tensor,
+        u: torch.Tensor,
+        w: Optional[torch.Tensor],
+        V_x: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return λ z^T M z when IQC mode is enabled, else zeros."""
+        if not self._iqc_enabled or w is None:
+            return torch.zeros_like(V_x)
+
+        z_iqc = self._compute_iqc_z(x, u, w)
+        M = self.iqc_M.to(device=z_iqc.device, dtype=z_iqc.dtype)
+        Mz = z_iqc @ M
+        zMz = (z_iqc * Mz).sum(dim=-1, keepdim=True)
+        return self.iqc_lambda * zMz
+
+    def _compute_core_terms(
+        self,
+        V_x: torch.Tensor,
+        V_next: torch.Tensor,
+        supply: torch.Tensor,
+        iqc_term: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build verification terms for either legacy or IQC mode."""
+        c = self.get_rho()
+        term1 = V_x - c
+
+        if self._iqc_enabled:
+            # Theorem 1 IQC conditions:
+            #   V(x+) - V(x) + z^T M z <= s(d, e)
+            #   V(x+) - V(x) + z^T M z <= 0
+            term2a = V_x - V_next - iqc_term + self.s_scale * supply
+            term2b = V_x - V_next - iqc_term
+        else:
+            # Legacy conditions:
+            #   dissipativity: V(x+) - V(x) <= s(d, e)
+            #   invariance:    V(x+) <= rho
+            term2a = V_x - V_next + self.s_scale * supply
+            term2b = c - V_next
+
+        return term1, term2a, term2b
 
     def _combine(self, term1, term2a, term2b, V_x):
         """Combine terms according to ``self.verification_mode``.
@@ -895,6 +1042,17 @@ class DissipativityDerivativeLoss(nn.Module):
             d = a - b
             return 0.5 * (a + b + self._relu(d) + self._relu(-d))
         return torch.max(torch.cat((a, b), dim=-1), dim=-1, keepdim=True).values
+
+    def _compute_iqc_z(self, x, u, w):
+        """Compute IQC signal z = (v, w) for z^T M z evaluation.
+
+        Default: v = u (controller output), z = [v; w].
+        If a custom iqc_z_fn is provided, use that instead.
+        """
+        if self._iqc_z_fn is not None:
+            return self._iqc_z_fn(x, u, w)
+        return torch.cat([u+w/2, w], dim=-1)
+        # return torch.cat([u, w], dim=-1)
 
 
 

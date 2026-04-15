@@ -1,9 +1,14 @@
 """
 Post-training formal verification of dissipativity via α,β-CROWN.
 
-Hybrid approach verifies two conditions (both must hold ∀ (ξ,w)):
+Hybrid approach (default, no IQC) verifies two conditions (both must hold ∀ (ξ,w)):
   1. Dissipativity: max(V(x)−ρ, V(x)−V(x⁺)+s·supply) ≥ 0  [single-output]
   2. Invariance: [ρ−V(x⁺), V(x)] with VNNLIB level-set V(x)≤ρ  [2-output]
+
+When ``supply_rate.uncertainty.type == iqc`` (disk-margin IQC), only the
+single-output ``dissipativity`` mode is used: it matches training’s
+``DissipativityDerivativeLoss`` with IQC term (max\{V−ρ, V−V⁺−λ zᵀMz + s_scale·s\}
+with Lyapunov supply s = −κV). No separate invariance pass.
 
 **Domain tightening**: For each candidate ρ, we compute a tight bounding box
 around the sublevel set {ξ : V(ξ) ≤ ρ} and use that as the CROWN input domain
@@ -29,8 +34,9 @@ import yaml
 # Config extraction helpers
 # ---------------------------------------------------------------------------
 
+
 def _extract_rinn_params(mcfg):
-    """Extract RINN controller parameters from model config."""
+    """Extract RINN controller parameters from model config (pendulum: inline matrices)."""
     rinn = mcfg["controller"]["rinn"]
     params = {k: rinn[k] for k in ("A", "Bw", "By", "Cv", "Dvw", "Dvy", "Cu", "Duw", "Duy")}
     params["activation"] = rinn.get("activation", "relu")
@@ -38,6 +44,7 @@ def _extract_rinn_params(mcfg):
     if u_max:
         params["u_lo"], params["u_up"] = [-u_max], [u_max]
     return params
+
 
 
 def _extract_lyap_params(mcfg):
@@ -76,19 +83,13 @@ def _build_lyapunov_evaluator(training_cfg, model_pth, device="cpu"):
     Returns a callable ``V(x_batch) -> values`` and the state dimension ``nx``.
     """
     from neural_lyapunov_training import lyapunov, controllers, dynamical_system
-    import neural_lyapunov_training.pendulum as pendulum
 
     mcfg = training_cfg["model"]
     lyap_cfg = mcfg.get("lyapunov", {})
 
-    # Build plant to get dimensions
-    pend_ct = pendulum.PendulumDynamics(m=0.15, l=0.5, beta=0.1)
-    plant = dynamical_system.SecondOrderDiscreteTimeSystem(
-        pend_ct, mcfg.get("dt", 0.01),
-        position_integration=dynamical_system.IntegrationMethod.MidPoint,
-        velocity_integration=dynamical_system.IntegrationMethod.ExplicitEuler,
-    )
-    n_plant = plant.nx
+    # Infer plant state dimension from model limits
+    model_limit = list(mcfg.get("limit", [0.6, 2.0]))
+    n_plant = len(model_limit)
 
     # Controller state dimension
     ctrl_cfg = mcfg.get("controller", {})
@@ -128,6 +129,10 @@ def _build_lyapunov_evaluator(training_cfg, model_pth, device="cpu"):
     lyap_nn.load_state_dict(lyap_sd, strict=False)
     lyap_nn.to(device).eval()
 
+    # Precompute Cholesky factor for CROWN-friendly quadratic form
+    if hasattr(lyap_nn, 'precompute_cholesky'):
+        lyap_nn.precompute_cholesky()
+
     @torch.no_grad()
     def evaluate_V(x_batch):
         return lyap_nn(x_batch.to(device)).squeeze(-1)
@@ -158,24 +163,33 @@ def compute_levelset_bbox(V_fn, nx, state_lower, state_upper, rho,
     lo = torch.tensor(state_lower, dtype=torch.float32)
     hi = torch.tensor(state_upper, dtype=torch.float32)
 
-    # Sample uniformly in the box
-    x = lo + (hi - lo) * torch.rand(n_samples, nx)
-
-    # Evaluate V in batches to avoid OOM
+    # Adaptive sampling: start with full box, then refine around the level set.
+    # For small rho, uniform sampling in a huge domain misses the tiny level set.
+    # Strategy: sample in progressively smaller boxes centered at origin until
+    # we find enough interior points.
     batch_size = 50000
-    V_vals = []
-    for i in range(0, n_samples, batch_size):
-        V_vals.append(V_fn(x[i:i + batch_size]).cpu())
-    V_vals = torch.cat(V_vals)
+    all_x_inside = []
+    for scale in [1.0, 0.5, 0.25, 0.1, 0.05, 0.01]:
+        box_lo = lo * scale
+        box_hi = hi * scale
+        x = box_lo + (box_hi - box_lo) * torch.rand(n_samples, nx)
+        V_vals = []
+        for i in range(0, n_samples, batch_size):
+            V_vals.append(V_fn(x[i:i + batch_size]).cpu())
+        V_vals = torch.cat(V_vals)
+        mask = V_vals <= rho
+        if mask.sum().item() > 0:
+            all_x_inside.append(x[mask])
+        if mask.sum().item() >= 100:
+            break
 
-    # Points inside the level set
-    mask = V_vals <= rho
-    n_inside = mask.sum().item()
-    if n_inside < 10:
-        # Level set too small to estimate — return full domain (conservative)
+    if not all_x_inside:
         return list(state_lower), list(state_upper)
 
-    x_inside = x[mask]
+    x_inside = torch.cat(all_x_inside)
+    n_inside = x_inside.shape[0]
+    if n_inside < 10:
+        return list(state_lower), list(state_upper)
 
     # Per-dimension min/max
     x_min = x_inside.min(dim=0).values
@@ -218,18 +232,21 @@ def build_customized_string(
     supply = training_cfg.get("supply_rate", {})
     loss_cfg = training_cfg.get("loss", {})
 
-    rinn_params = _extract_rinn_params(mcfg)
     lyap_params = _extract_lyap_params(mcfg)
     act_str = _ACT_STR_MAP.get(lyap.get("activation", "leaky_relu"), "torch.nn.LeakyReLU")
-
     s_scale = float(s_scale_override) if s_scale_override is not None else loss_cfg.get("s_scale", 1.0)
+
+    # Default: pendulum RINN
+    rinn_params = _extract_rinn_params(mcfg)
+    uncertainty = supply.get("uncertainty", {})
+    unc_type = uncertainty.get("type", "").lower() if uncertainty else ""
 
     parts = [
         f'"{models_py_path}"',
         f'"create_pendulum_rinn_state_feedback_model"',
         f"dt={mcfg.get('dt', 0.01)}",
         f"gamma={supply.get('gamma', 100.0)}",
-        f"w_max={supply.get('w_max', 0.024525)}",
+        f"w_max={supply.get('d_max', supply.get('w_max', 0.024525))}",
         f"rho={rho}",
         f"s_scale={s_scale}",
         f"rinn_parameters={repr(rinn_params)}",
@@ -237,6 +254,24 @@ def build_customized_string(
         f"output_C={repr(mcfg.get('output_C', [[1.0, 0.0], [0.0, 1.0]]))}",
         f'verification_mode="{verification_mode}"',
     ]
+
+    if unc_type == 'disk_margin' or unc_type == 'sector_bound':
+        parts.append(f'uncertainty_type="{unc_type}"')
+        parts.append(f"disk_alpha={uncertainty.get('alpha', 0.353)}")
+        parts.append(f"disk_sigma={uncertainty.get('sigma', 0.0)}")
+        parts.append(f"disk_c_bar={uncertainty.get('c_bar', 3.0)}")
+        parts.append(f"kappa={mcfg.get('kappa', 0.0)}")
+    elif unc_type == 'iqc':
+        iqc_cfg = uncertainty.get('iqc', {})
+        parts.append(f'uncertainty_type="iqc"')
+        parts.append(f"disk_alpha={iqc_cfg.get('alpha', 0.353)}")
+        parts.append(f"disk_sigma={iqc_cfg.get('sigma', 0.0)}")
+        parts.append(f"kappa={mcfg.get('kappa', 0.0)}")
+        parts.append(f"iqc_lambda={iqc_cfg.get('lambda_final', iqc_cfg.get('lambda_init', 1.0))}")
+        M_list = iqc_cfg.get('M', None)
+        if M_list is not None:
+            parts.append(f"iqc_M={repr(M_list)}")
+
     return "Customized(" + ", ".join(parts) + ")"
 
 
@@ -250,6 +285,7 @@ def generate_config_template(
     timeout=100000000, device="auto", batch_size=None,
     s_scale_override=None, verification_mode='combined',
     use_domain_placeholders=False,
+    enable_incomplete_verification=False,
 ):
     """Write an α,β-CROWN YAML config with ``__RHO__`` placeholder.
 
@@ -262,15 +298,17 @@ def generate_config_template(
     if batch_size is None:
         if device == "cuda":
             # Adaptive GPU batch size based on Lyapunov NN width.
-            # Larger NNs need smaller batches to avoid OOM.
+            # auto_enlarge_batch_size will grow if VRAM headroom exists.
             lyap_widths = training_cfg.get("model", {}).get("lyapunov", {}).get("hidden_widths", [32, 32])
             max_width = max(lyap_widths) if lyap_widths else 32
-            if max_width >= 128:
-                batch_size = 32768
+            if max_width >= 256:
+                batch_size = 2048
+            elif max_width >= 128:
+                batch_size = 8192
             elif max_width >= 64:
-                batch_size = 65536
+                batch_size = 32768
             else:
-                batch_size = 131072
+                batch_size = 65536
         else:
             batch_size = 1000
 
@@ -300,7 +338,7 @@ def generate_config_template(
         "general": {
             "device": device,
             "conv_mode": "matrix",
-            "enable_incomplete_verification": (device == "cuda"),
+            "enable_incomplete_verification": enable_incomplete_verification,
             "root_path": os.path.dirname(os.path.abspath(config_path)),
             "csv_name": csv_name,
         },
@@ -315,7 +353,12 @@ def generate_config_template(
         "attack": {"pgd_order": "before"},
         "solver": {
             "batch_size": batch_size,
+            "auto_enlarge_batch_size": True,
             "min_batch_size_ratio": 0.0,
+            # CROWN (not alpha-CROWN) is used because the Lyapunov model
+            # contains non-standard operators (MinMax, Mul, convex-concave
+            # activations) whose alpha-CROWN backward relaxations are
+            # incompatible with intermediate bound computation.
             "bound_prop_method": "crown",
         },
         "bab": {
@@ -323,13 +366,18 @@ def generate_config_template(
             "decision_thresh": -1e-6,
             "branching": {
                 "method": "sb",
+                "candidates": 3,
                 "input_split": {
                     "enable": True,
                     "ibp_enhancement": True,
                     "compare_with_old_bounds": True,
                     "adv_check": 100,
                     "sb_coeff_thresh": 0.01,
-                    "enable_clip_domains": True,
+                },
+            },
+            "clip_n_verify": {
+                "clip_input_domain": {
+                    "enabled": True,
                 },
             },
         },
@@ -342,6 +390,35 @@ def generate_config_template(
 # ---------------------------------------------------------------------------
 # Single-ρ verification
 # ---------------------------------------------------------------------------
+
+def _compute_extra_splits(extra_lower, extra_upper, n_splits=2):
+    """Split extra-input dimensions for tighter CROWN bounds.
+
+    For dimensions spanning 0 (e.g., w̃ ∈ [−c̄, c̄] through tanh),
+    splitting produces narrower sub-ranges that dramatically tighten
+    CROWN's linear relaxation.
+
+    Args:
+        n_splits: Number of equal-width sub-intervals per dimension (default 2).
+
+    Returns list of (split_lower, split_upper) tuples covering the full domain.
+    """
+    if not extra_lower or not extra_upper:
+        return [(list(extra_lower), list(extra_upper))]
+    import itertools
+    per_dim = []
+    for lo, hi in zip(extra_lower, extra_upper):
+        if n_splits > 1 and hi - lo > 1e-10:
+            step = (hi - lo) / n_splits
+            per_dim.append([(lo + i * step, lo + (i + 1) * step)
+                            for i in range(n_splits)])
+        else:
+            per_dim.append([(lo, hi)])
+    return [
+        ([lo for lo, hi in combo], [hi for lo, hi in combo])
+        for combo in itertools.product(*per_dim)
+    ]
+
 
 def _ensure_abcrown_on_path():
     """Add alpha-beta-CROWN to sys.path if needed."""
@@ -370,7 +447,7 @@ def _check_rho(rho, check_args, config_template_path, timeout_override=None,
     """
     from contextlib import redirect_stdout, redirect_stderr
     _ensure_abcrown_on_path()
-    from complete_verifier import ABCROWN
+    from abcrown import ABCROWN
 
     mode = check_args.mode
     timeout = timeout_override if timeout_override is not None else check_args.timeout
@@ -392,21 +469,48 @@ def _check_rho(rho, check_args, config_template_path, timeout_override=None,
         print(f"Checking rho={rho} ({mode}) timeout={timeout}s pgd={pgd_restarts} [full domain]")
 
     # 1. Regenerate VNNLIB specs with tight domain
-    cmd_parts = [
-        f"{sys.executable} -m neural_lyapunov_training.generate_vnnlib",
-        f"--lower_limit {' '.join(map(str, vnnlib_lower))}",
-        f"--upper_limit {' '.join(map(str, vnnlib_upper))}",
-        f"--hole_size {check_args.hole_size}",
-    ]
-    if mode == 'invariance':
-        cmd_parts.append(f"--value_levelset {rho}")
-    cmd_parts.append("--no_check_x_next")
-    if check_args.extra_input_lower:
-        cmd_parts.append(f"--extra_input_lower {' '.join(map(str, check_args.extra_input_lower))}")
-        cmd_parts.append(f"--extra_input_upper {' '.join(map(str, check_args.extra_input_upper))}")
-    output_gen = os.path.join(check_args.output_folder, f"rho_{rho:.5f}_spec.txt")
-    cmd_parts.append(f"-- {check_args.spec_prefix} >{output_gen} 2>&1")
-    os.system(" ".join(cmd_parts))
+    # Split extra-input dimensions for tighter CROWN bounds (helps with tanh)
+    extra_lo = list(check_args.extra_input_lower) if check_args.extra_input_lower else []
+    extra_hi = list(check_args.extra_input_upper) if check_args.extra_input_upper else []
+    n_splits = getattr(check_args, 'extra_input_splits', 2)
+    extra_splits = _compute_extra_splits(extra_lo, extra_hi, n_splits=n_splits)
+    n_extra_splits = len(extra_splits)
+    if n_extra_splits > 1:
+        print(f"  Splitting extra-input into {n_extra_splits} sub-ranges for tighter bounds")
+
+    all_spec_files = []
+    for split_idx, (slo, shi) in enumerate(extra_splits):
+        suffix = f"_w{split_idx}" if n_extra_splits > 1 else ""
+        split_prefix = f"{check_args.spec_prefix}{suffix}"
+
+        cmd_parts = [
+            f"{sys.executable} -m neural_lyapunov_training.generate_vnnlib",
+            f"--lower_limit {' '.join(map(str, vnnlib_lower))}",
+            f"--upper_limit {' '.join(map(str, vnnlib_upper))}",
+            f"--hole_size {check_args.hole_size}",
+        ]
+        if mode == 'invariance':
+            cmd_parts.append(f"--value_levelset {rho}")
+        cmd_parts.append("--no_check_x_next")
+        if slo:
+            cmd_parts.append(f"--extra_input_lower {' '.join(map(str, slo))}")
+            cmd_parts.append(f"--extra_input_upper {' '.join(map(str, shi))}")
+        gen_log = os.path.join(check_args.output_folder,
+                               f"rho_{rho:.5f}_spec{suffix}.txt")
+        cmd_parts.append(f"-- {split_prefix} >{gen_log} 2>&1")
+        os.system(" ".join(cmd_parts))
+
+        # Collect VNNLIB file paths from the split's CSV
+        split_csv = f"{split_prefix}.csv"
+        if os.path.exists(split_csv):
+            with open(split_csv) as f:
+                all_spec_files.extend(line.strip() for line in f if line.strip())
+
+    # Write combined CSV
+    combined_csv = f"{check_args.spec_prefix}.csv"
+    with open(combined_csv, "w") as cf:
+        for spec_file in all_spec_files:
+            cf.write(spec_file + "\n")
 
     # 2. Rewrite config with actual ρ AND tight domain
     with open(config_template_path) as f:
@@ -441,6 +545,10 @@ def _check_rho(rho, check_args, config_template_path, timeout_override=None,
             print(f"  CUDA OOM → unknown ({elapsed:.1f}s)")
             return "unknown"
         raise
+    except (AssertionError, ValueError) as e:
+        elapsed = time.time() - t_start
+        print(f"  ABCROWN error: {e} → unknown ({elapsed:.1f}s)")
+        return "unknown"
 
     # Parse result
     if any("unsafe" in k for k in ret):
@@ -548,13 +656,25 @@ def _read_s_scale_from_checkpoint(model_pth):
     return None
 
 
+def _read_iqc_lambda_from_checkpoint(model_pth):
+    """Read trained IQC multiplier λ = exp(_log_iqc_lambda) if present."""
+    try:
+        ckpt = torch.load(model_pth, map_location="cpu", weights_only=False)
+        sd = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+        if "_log_iqc_lambda" in sd:
+            return float(torch.exp(sd["_log_iqc_lambda"]).item())
+    except Exception:
+        pass
+    return None
+
+
 def _find_model_checkpoint(training_dir, model_pth_override=None):
     """Locate model checkpoint, trying several candidates."""
     if model_pth_override:
         if os.path.exists(model_pth_override):
             return os.path.abspath(model_pth_override)
         return None
-    for name in ["lyaloss_1.pth", "lyaloss_1.0.pth", "lyapunov_nn.pth"]:
+    for name in ["lyaloss_1.pth", "lyaloss_1.0.pth", "lyapunov_nn.pth", "lyaloss_init.pth"]:
         p = os.path.join(training_dir, name)
         if os.path.exists(p):
             return os.path.abspath(p)
@@ -572,12 +692,16 @@ def run_verification(
     device="auto", batch_size=None, effective_s_scale=None, pure_quadratic=False,
     smart_bracket=False, bracket_shift=None, pgd_restarts=10000, rho_bisect_tol=None,
     domain_tightening=True, tightening_samples=500000, tightening_margin=1.05,
+    verify_nominal=False, verify_c_bar=None,
+    enable_incomplete_verification=False,
+    extra_input_splits=2,
 ):
     """Run hybrid formal verification with bisection on ρ.
 
-    Checks invariance first (faster per-spec, quicker safe/unknown signal)
-    then dissipativity (single-output, reliable falsification).
-    Both must pass for a candidate ρ to be accepted.
+    Default (no IQC): runs dissipativity, then invariance; both must pass.
+
+    IQC disk-margin (``uncertainty.type: iqc``): one pass, ``verification_mode=
+    dissipativity`` only — the same scalar φ as training (ROA + IQC decrease).
 
     Domain tightening (default ON):
         For each candidate ρ, computes a tight bounding box around the
@@ -619,11 +743,65 @@ def run_verification(
         training_cfg["model"].setdefault("lyapunov", {})["use_nonlinear"] = False
         _log("[verify] pure_quadratic=True: NN component disabled")
 
+    # Nominal verification: remove uncertainty (4D input, no w̃)
+    if verify_nominal:
+        if not isinstance(training_cfg, dict) or id(training_cfg) == id(training_cfg):
+            training_cfg = copy.deepcopy(training_cfg)
+        training_cfg["_verify_nominal"] = True
+        _log("[verify] verify_nominal=True: uncertainty disabled for CROWN")
+
+    # verify_c_bar: use smaller c_bar for verification (tighter tanh bounds)
+    if verify_c_bar is not None:
+        if not isinstance(training_cfg, dict) or id(training_cfg) == id(training_cfg):
+            training_cfg = copy.deepcopy(training_cfg)
+        training_cfg["_verify_c_bar"] = float(verify_c_bar)
+        _log(f"[verify] verify_c_bar={verify_c_bar} (training c_bar="
+             f"{training_cfg.get('supply_rate', {}).get('uncertainty', {}).get('c_bar', 3.0)})")
+
     mcfg = training_cfg["model"]
     supply = training_cfg.get("supply_rate", {})
     full_limit = _get_full_state_limits(mcfg)
-    w_max_val = supply.get("w_max", 0.024525)
-    w_lower, w_upper = [-w_max_val], [w_max_val]
+
+    # Determine extra-input (disturbance / free-parameter) bounds
+    if verify_nominal:
+        # For nominal+L2-gain, still need w dimension (box disturbance)
+        supply_type = supply.get("type", "lyapunov")
+        w_max_val = supply.get("d_max", supply.get("w_max", 0.0))
+        if supply_type == "l2gain" and w_max_val > 0:
+            w_lower, w_upper = [-w_max_val], [w_max_val]
+        else:
+            # No disturbance dimension for nominal Lyapunov verification
+            w_lower, w_upper = [], []
+    else:
+        uncertainty = supply.get("uncertainty", {})
+        uncertainty_type = uncertainty.get("type", None)
+        if uncertainty_type == "tanh_norm_ball":
+            c_bar = uncertainty.get("c_bar", 3.0)
+            if verify_c_bar is not None:
+                c_bar = float(verify_c_bar)
+            n_w_plant = 1
+            w_lower = [-c_bar] * n_w_plant
+            w_upper = [c_bar] * n_w_plant
+        elif uncertainty_type == "iqc":
+            iqc_cfg = uncertainty.get("iqc", {})
+            w_bound = uncertainty.get("w_bound", None)
+            if w_bound is None:
+                alpha = iqc_cfg.get("alpha", 0.353)
+                sigma = iqc_cfg.get("sigma", 0.0)
+                beta = (1.0 + sigma) / 2.0
+                u_max_val = mcfg.get("u_max", 0.75)
+                w_bound = alpha * u_max_val / (1.0 - alpha * beta)
+            w_lower, w_upper = [-w_bound], [w_bound]
+        elif uncertainty_type == "disk_margin":
+            c_bar = uncertainty.get("c_bar", 3.0)
+            if verify_c_bar is not None:
+                c_bar = float(verify_c_bar)
+            w_lower, w_upper = [-c_bar], [c_bar]
+        elif uncertainty_type == "sector_bound":
+            w_lower, w_upper = [-1.0], [1.0]
+        else:
+            w_max_val = supply.get("d_max", supply.get("w_max", 0.024525))
+            w_lower, w_upper = [-w_max_val], [w_max_val]
 
     # Find model checkpoint
     model_pth = _find_model_checkpoint(training_dir, model_pth_override)
@@ -658,8 +836,23 @@ def run_verification(
     # and inject into config so the verification model uses the trained value.
     _read_and_apply_learned_nn_scale(model_pth, training_cfg)
 
-    # Strip training-only parameters so CROWN's strict load succeeds
-    _strip_checkpoint_keys(effective_model_pth, ["_log_s_scale", "_log_nn_scale"])
+    # Inject IQC λ from checkpoint into config (verification uses fixed λ, no _log param)
+    iqc_lambda_ckpt = _read_iqc_lambda_from_checkpoint(model_pth)
+    if iqc_lambda_ckpt is not None:
+        training_cfg.setdefault("supply_rate", {}).setdefault("uncertainty", {}).setdefault(
+            "iqc", {})["lambda_final"] = iqc_lambda_ckpt
+        _log(f"[verify] IQC λ from checkpoint: {iqc_lambda_ckpt:.6f}")
+
+    # Strip keys absent from the CROWN verification graph / fixed-λ IQC model
+    _strip_checkpoint_keys(
+        effective_model_pth,
+        [
+            "_log_s_scale",
+            "_log_nn_scale",
+            "_log_iqc_lambda",  # λ baked into config + iqc_lambda= in Customized()
+            "lyapunov.L_chol",  # optional Cholesky buffer from precompute_cholesky; graph uses R matrices
+        ],
+    )
 
     state_lower = [-v for v in full_limit]
     state_upper = list(full_limit)
@@ -692,12 +885,18 @@ def run_verification(
             V_fn = None
             domain_tightening = False
 
-    # Invariance first (faster per-spec, quicker safe/unknown signal),
-    # then dissipativity (single-output, heavier but reliable falsification).
-    MODES = ['invariance', 'dissipativity']
+    # IQC (disk-margin): one scalar condition — same as training forward in
+    # verification_mode='dissipativity' (includes λ·zᵀMz and Lyapunov supply).
+    # Legacy / L2-gain: dissipativity + invariance (both must pass).
+    unc_for_modes = supply.get("uncertainty", {})
+    if str(unc_for_modes.get("type", "")).lower() == "iqc":
+        MODES = ["dissipativity"]
+        _log("[verify] IQC uncertainty: single CROWN pass (dissipativity only)")
+    else:
+        MODES = ["dissipativity", "invariance"]
 
     try:
-        from neural_lyapunov_training.bisect import run_bisect
+        from neural_lyapunov_training.rho_bisect import run_bisect
 
         # Set up per-mode directories and config templates
         mode_resources = {}
@@ -717,6 +916,7 @@ def run_verification(
                 timeout=timeout, device=device, batch_size=batch_size,
                 s_scale_override=effective_s_scale, verification_mode=mode,
                 use_domain_placeholders=domain_tightening,
+                enable_incomplete_verification=enable_incomplete_verification,
             )
 
             check_args = types.SimpleNamespace(
@@ -724,6 +924,7 @@ def run_verification(
                 lower_limit=state_lower, upper_limit=state_upper,
                 hole_size=hole_size, timeout=timeout,
                 extra_input_lower=w_lower, extra_input_upper=w_upper,
+                extra_input_splits=extra_input_splits,
                 mode=mode,
             )
             mode_resources[mode] = (check_args, config_template)

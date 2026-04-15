@@ -1,13 +1,48 @@
-.ipynb_checkpoints
+# Python
 *.pyc
-__pycache__
-*.swp
-wandb/*
-data/*
+__pycache__/
+*.egg-info/
 *.compiled
-venv/*
-output/*
-models/lyaloss*
-*.egg-info
+
+# Editors
+*.swp
+*.swo
+*~
+.ipynb_checkpoints/
+
+# Environment
+venv/
+.pytest_cache/
+
+# Experiment outputs
+output/
+outputs/
+wandb/
+data/
+.hydra/
+
+# Verification artifacts
 verification/specs/bisect*.*
 verification/out*
+
+# Generated model checkpoints (keep curated models/ only)
+models/lyaloss*
+
+# alpha-beta-CROWN verifier (clone separately, see README)
+alpha-beta-CROWN/
+
+# LaTeX build artifacts
+tex/*.aux
+tex/*.bbl
+tex/*.bcf
+tex/*.blg
+tex/*.fdb_latexmk
+tex/*.fls
+tex/*.log
+tex/*.out
+tex/*.run.xml
+tex/*.synctex.gz
+tex/*-blx.bib
+
+# Crown-dissipativity LMI baseline (separate repo)
+crown-dissipativity/

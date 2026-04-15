@@ -60,18 +60,37 @@ class FirstOrderDiscreteTimeSystem(DiscreteTimeSystem):
         self.integration = integration
         self.continuous_time_system = continuous_time_system
         self.Ix = torch.eye(self.nx)
+        # Disturbance dimension (if supported by continuous system)
+        self.nw = getattr(continuous_time_system, 'nw', 0)
 
-    def forward(self, x, u):
+    def forward(self, x, u, w=None):
         """
-        Compute x_next for a batch of x and u
+        Compute x_next for a batch of x and u, with optional disturbance w.
+
+        Args:
+            x: state (batch, nx)
+            u: control input (batch, nu)
+            w: disturbance input (batch, nw), optional
+
+        Returns:
+            x_next: next state (batch, nx)
         """
         assert x.shape[0] == u.shape[0]
-        xdot = self.continuous_time_system.forward(x, u)
+        if w is not None and hasattr(self.continuous_time_system, 'nw'):
+            xdot = self.continuous_time_system.forward(x, u, w)
+        else:
+            xdot = self.continuous_time_system.forward(x, u)
         if self.integration == IntegrationMethod.ExplicitEuler:
             x_next = x + xdot * self.dt
         else:
             raise NotImplementedError
         return x_next
+
+    def output(self, x, u):
+        """Performance output z for dissipativity analysis."""
+        if hasattr(self.continuous_time_system, 'output'):
+            return self.continuous_time_system.output(x, u)
+        return x
 
     @property
     def x_equilibrium(self):

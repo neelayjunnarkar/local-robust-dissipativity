@@ -35,7 +35,7 @@ def _ensure_abcrown_on_path():
 def check_rho(rho, args, additional_args):
     """Verify a single ρ value.  Returns ``'safe'``, ``'unsafe'``, or ``'unknown'``."""
     _ensure_abcrown_on_path()
-    from complete_verifier import ABCROWN
+    from abcrown import ABCROWN
 
     print(f"Checking rho={rho}")
     output_gen_spec = os.path.join(
@@ -104,7 +104,9 @@ def run_bisect(check_fn, init_rho, rho_eps=0.001, rho_multiplier=1.2, max_iters=
         check_fn: callable(rho) -> ``'safe'``/``'unsafe'``/``'unknown'``
         init_rho: Initial ρ value (typically the PGD-verified ρ).
         rho_eps: Bisection precision.
-        rho_multiplier: Growth / shrink factor.
+        rho_multiplier: Growth / shrink factor. Values ``<= 1`` do not permit
+            geometric progress; in that case an internal effective multiplier
+            is chosen so the search still makes strict progress.
         max_iters: Maximum bisection iterations (``None`` = unlimited).
         max_shrink_iters: Maximum shrink iterations when initial ρ is not safe.
         smart_bracket: If True, skip the bracket-finding phase and use a
@@ -127,12 +129,45 @@ def run_bisect(check_fn, init_rho, rho_eps=0.001, rho_multiplier=1.2, max_iters=
     t0 = time.time()
     total_checks = 0
 
+    def _effective_search_multiplier():
+        if rho_multiplier > 1.0:
+            return rho_multiplier
+        if bracket_shift is not None and 0.0 < bracket_shift < 1.0:
+            eff = 1.0 / bracket_shift
+        else:
+            eff = 1.25
+        print(
+            f"[bisect] rho_multiplier={rho_multiplier:.6f} does not permit geometric "
+            f"search; using effective multiplier={eff:.6f}."
+        )
+        return eff
+
+    search_multiplier = _effective_search_multiplier()
+
     def _check(rho):
         nonlocal total_checks
         total_checks += 1
         t = time.time() - t0
         print(f"[bisect] check #{total_checks} | rho={rho:.6f} | elapsed={t:.1f}s")
         return check_fn(rho)
+
+    def _grow(rho):
+        next_rho = rho * search_multiplier
+        if next_rho <= rho:
+            raise RuntimeError(
+                f"Bisection grow step did not increase rho: rho={rho}, "
+                f"multiplier={search_multiplier}"
+            )
+        return next_rho
+
+    def _shrink(rho):
+        next_rho = rho / search_multiplier
+        if next_rho >= rho:
+            raise RuntimeError(
+                f"Bisection shrink step did not decrease rho: rho={rho}, "
+                f"multiplier={search_multiplier}"
+            )
+        return next_rho
 
     if smart_bracket and bracket_shift is not None:
         # Shifted-probe strategy:
@@ -150,13 +185,13 @@ def run_bisect(check_fn, init_rho, rho_eps=0.001, rho_multiplier=1.2, max_iters=
         ret = _check(probe)
         if ret == "safe":
             rho_l = probe
-            rho_u = init_rho * rho_multiplier
+            rho_u = _grow(init_rho)
             print(f"[bisect] Probe safe → bracket [{rho_l:.6f}, {rho_u:.6f}] (search upward)")
         else:
             # Probe failed: safe region is somewhere below probe.  Set upper
             # bound to probe and look for a safe lower bound.
             rho_u = probe
-            rho_l = init_rho / rho_multiplier
+            rho_l = _shrink(probe)
             print(f"[bisect] Probe unsafe ({ret}) → bracket [{rho_l:.6f}, {rho_u:.6f}] "
                   f"(search downward; verifying lower bound...)")
             ret_l = _check(rho_l)
@@ -166,7 +201,7 @@ def run_bisect(check_fn, init_rho, rho_eps=0.001, rho_multiplier=1.2, max_iters=
                 rho = rho_l
                 shrink_count = 0
                 while ret_l != "safe":
-                    rho /= rho_multiplier
+                    rho = _shrink(rho)
                     shrink_count += 1
                     if rho < 1e-10 or shrink_count >= max_shrink_iters:
                         print(f"[bisect] Could not find any safe rho after "
@@ -174,12 +209,12 @@ def run_bisect(check_fn, init_rho, rho_eps=0.001, rho_multiplier=1.2, max_iters=
                         return 0.0, 0.0
                     ret_l = _check(rho)
                 rho_l = rho
-                rho_u = rho * rho_multiplier  # tighten upper bound
+                rho_u = _grow(rho)  # tighten upper bound
 
     elif smart_bracket:
         # Original smart_bracket: no probe-shift — verify lower bound directly.
-        rho_l = init_rho / rho_multiplier
-        rho_u = init_rho * rho_multiplier
+        rho_l = _shrink(init_rho)
+        rho_u = _grow(init_rho)
         print(f"[bisect] Smart bracket: [{rho_l:.6f}, {rho_u:.6f}]")
         print(f"[bisect] Verifying lower bound rho_l={rho_l:.6f}...")
         ret = _check(rho_l)
@@ -190,35 +225,35 @@ def run_bisect(check_fn, init_rho, rho_eps=0.001, rho_multiplier=1.2, max_iters=
             rho = rho_l
             shrink_count = 0
             while ret != "safe":
-                rho /= rho_multiplier
+                rho = _shrink(rho)
                 shrink_count += 1
                 if rho < 1e-10 or shrink_count >= max_shrink_iters:
                     print(f"[bisect] Could not find any safe rho after {shrink_count} shrink iterations.")
                     return 0.0, 0.0
                 ret = _check(rho)
             rho_l = rho
-            rho_u = rho * rho_multiplier
+            rho_u = _grow(rho)
     else:
         rho = init_rho
         ret = _check(rho)
 
         if ret == "safe":
             while ret == "safe":
-                rho *= rho_multiplier
+                rho = _grow(rho)
                 ret = _check(rho)
-            rho_l = rho / rho_multiplier
+            rho_l = _shrink(rho)
             rho_u = rho
         else:
             shrink_count = 0
             while ret != "safe":
-                rho /= rho_multiplier
+                rho = _shrink(rho)
                 shrink_count += 1
                 if rho < 1e-10 or shrink_count >= max_shrink_iters:
                     print(f"[bisect] Could not find any safe rho after {shrink_count} shrink iterations.")
                     return 0.0, 0.0
                 ret = _check(rho)
             rho_l = rho
-            rho_u = rho * rho_multiplier
+            rho_u = _grow(rho)
 
     print(f"[bisect] Bracket: [{rho_l:.6f}, {rho_u:.6f}] | "
           f"width={rho_u - rho_l:.6f} | rho_eps={rho_eps}")

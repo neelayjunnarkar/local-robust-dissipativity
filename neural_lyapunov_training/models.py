@@ -656,31 +656,32 @@ def create_pendulum_rinn_state_feedback_model(
     lyapunov_parameters=None,
     output_C=None,
     verification_mode='combined',
+    uncertainty_type='l2gain',
+    disk_alpha=0.353,
+    disk_sigma=0.0,
+    disk_c_bar=3.0,
+    kappa=0.0,
+    iqc_lambda=1.0,
+    iqc_M=None,
 ):
     """
     Create pendulum state-feedback verification model with RINN controller.
 
-    Builds the full augmented dynamics [x_p, x_k] with dissipativity (L2-gain)
-    verification.  ρ is baked into the model's min/max condition, so the VNNLIB
-    spec only needs to assert output ≥ 0 (no external level-set constraint).
+    Builds the full augmented dynamics [x_p, x_k] with dissipativity
+    verification.  ρ is baked into the model's min/max condition, so the
+    VNNLIB spec only needs to assert output ≥ 0.
 
-    The verifier input is [ξ, w] where ξ = [x_p, x_k] (4D) and w is the
-    disturbance (1D), totalling 5D.  Output: single scalar (1D).
+    The verifier input is [ξ, w̃] where ξ = [x_p, x_k] (4D) and w̃ is
+    the disturbance / free parameter (1D), totalling 5D.
 
-    Condition verified for all (ξ, w) in box:
-        max{V(ξ)-ρ, min{V(ξ)-V(ξ⁺)+α·s(w,z), ρ-V(ξ⁺)}} ≥ 0
+    Supports two uncertainty modes:
+      - 'l2gain' (default): Box disturbance w ∈ [−w_max, w_max] with
+        L2-gain supply rate s = ‖w‖² − (1/γ²)‖z‖².
+      - 'disk_margin': Disk margin D(α, σ) uncertainty via
+        DiskMarginTransform.  Supply rate is Lyapunov (s = −κV).
+        Verifies: ∀w̃ ∈ [−c̄, c̄], V(ξ⁺(w(ũ, w̃))) ≤ (1−κ)V(ξ).
 
     Weights are loaded by α,β-CROWN via the ``model.path`` config field.
-
-    Args:
-        dt: Discretisation time step.
-        gamma: L2-gain bound.
-        w_max: Scalar disturbance bound |w| ≤ w_max.
-        rho: Fixed ROA sublevel set value (for bisection).
-        s_scale: Supply rate scaling factor.
-        rinn_parameters: Dict with RINN matrices and config.
-        lyapunov_parameters: Dict with Lyapunov function config.
-        output_C: Performance output matrix z = C_z * x_p.
     """
     # -- plant dynamics --
     pend_ct = pendulum.PendulumDynamics(
@@ -694,9 +695,8 @@ def create_pendulum_rinn_state_feedback_model(
     )
 
     n_plant = plant.nx  # 2
-    nw = pend_ct.nw     # 1
 
-    # -- RINN controller (trainable=True + freeze_dvw to match training state_dict) --
+    # -- RINN controller --
     rp = rinn_parameters or {}
     _t = lambda v: torch.tensor(v, dtype=torch.float32) if not isinstance(v, torch.Tensor) else v
 
@@ -716,10 +716,9 @@ def create_pendulum_rinn_state_feedback_model(
 
     # -- augmented dynamics --
     aug_dyn = dynamical_system.AugmentedRINNDynamics(plant, rinn_ctrl)
-    nx = aug_dyn.nx  # n_plant + n_k
+    nx = aug_dyn.nx
 
     # -- Lyapunov function --
-    # Ensure R_trainable and R_frozen exist so state_dict keys match the training checkpoint.
     lp = dict(lyapunov_parameters or {})
     if 'R_trainable' not in lp:
         lp['R_trainable'] = torch.zeros(nx, nx)
@@ -731,8 +730,41 @@ def create_pendulum_rinn_state_feedback_model(
         **lp,
     )
 
-    # -- supply rate & loss --
-    supply_fn = supply_rate.L2GainSupplyRate(gamma=gamma)
+    # -- supply rate & uncertainty --
+    from neural_lyapunov_training.uncertainty import (
+        DiskMarginTransform, SectorBoundTransform,
+        disk_margin_iqc_z_fn, disk_margin_iqc_M,
+    )
+
+    uncertainty_xform = None
+    iqc_kwargs = {}
+
+    if uncertainty_type == 'iqc':
+        supply_fn = supply_rate.LyapunovSupplyRate(kappa=kappa)
+        effective_w_max = torch.tensor([w_max])
+        # IQC multiplier for CROWN verification
+        M_tensor = torch.tensor(iqc_M, dtype=torch.float32) if iqc_M is not None else disk_margin_iqc_M(disk_alpha)
+        z_fn = disk_margin_iqc_z_fn(sigma=disk_sigma)
+        iqc_kwargs = {
+            'iqc_M': M_tensor,
+            'iqc_z_fn': z_fn,
+            'iqc_lambda_init': iqc_lambda,
+            'learnable_iqc_lambda': False,
+        }
+    elif uncertainty_type == 'sector_bound':
+        supply_fn = supply_rate.LyapunovSupplyRate(kappa=kappa)
+        uncertainty_xform = SectorBoundTransform(alpha=disk_alpha)
+        effective_w_max = torch.tensor([1.0])
+    elif uncertainty_type == 'disk_margin':
+        supply_fn = supply_rate.LyapunovSupplyRate(kappa=kappa)
+        uncertainty_xform = DiskMarginTransform(
+            alpha=disk_alpha, sigma=disk_sigma, c_bar=disk_c_bar,
+        )
+        effective_w_max = torch.tensor([disk_c_bar])
+    else:
+        supply_fn = supply_rate.L2GainSupplyRate(gamma=gamma)
+        effective_w_max = torch.tensor([w_max])
+
     loss_fn = lyapunov.DissipativityDerivativeLoss(
         dynamics=aug_dyn,
         controller=rinn_ctrl,
@@ -741,19 +773,198 @@ def create_pendulum_rinn_state_feedback_model(
         box_lo=torch.zeros(nx),
         box_up=torch.zeros(nx),
         rho_multiplier=1.0,
-        w_max=torch.tensor([w_max]),
+        w_max=effective_w_max,
         beta=100,
         hard_max=True,
         s_scale=s_scale,
-        relu_minmax=True,  # auto_LiRPA backward compatibility
+        relu_minmax=True,
         verification_mode=verification_mode,
+        uncertainty_transform=uncertainty_xform,
+        **iqc_kwargs,
     )
 
-    # Bake in the fixed ρ (survives ABCROWN's load_state_dict since it's a plain attr)
+    loss_fn._fixed_rho = rho
+    return loss_fn
+
+
+def create_flexible_rod_rinn_model(
+    dt=0.005,
+    rho=0.0,
+    s_scale=1.0,
+    gamma_delta=0.1,
+    c_bar=3.0,
+    n_k=2,
+    n_w_rinn=8,
+    activation='relu',
+    u_max=20.0,
+    controller_limit=None,
+    m_b=1.0,
+    m_t=0.1,
+    L=1.0,
+    rho_l=0.1,
+    lyapunov_parameters=None,
+    output_C=None,
+    verification_mode='combined',
+    kappa=0.0,
+    nominal=False,
+    supply_type='lyapunov',
+    gamma=100.0,
+    w_max=0.0,
+):
+    """
+    Create flexible rod + RINN + tanh norm-ball verification model.
+
+    Builds the full augmented dynamics [x_p, x_k] with Lyapunov stability
+    verification and tanh norm-ball uncertainty parameterization.
+
+    The verifier input is [ξ, w̃] where ξ = [x_p, x_k] (4D) and w̃ is
+    the free uncertainty parameter (1D), totalling 5D.
+
+    Internally, w̃ is mapped to w via TanhNormBallTransform:
+        w = γ_Δ ||u|| tanh(||w̃||) / (||w̃|| + ε) · w̃
+    guaranteeing ||w|| < γ_Δ ||u|| for all w̃.
+
+    Weights are loaded by α,β-CROWN via the ``model.path`` config field.
+    Dummy matrices are used for RINN init; CROWN overwrites from checkpoint.
+
+    Args:
+        dt: Discretisation time step.
+        rho: Fixed ROA sublevel set value (for bisection).
+        s_scale: Supply rate scaling factor.
+        gamma_delta: Uncertainty gain bound ||Δ|| ≤ γ_Δ.
+        c_bar: Free parameter box bound: w̃ ∈ [-c̄, c̄].
+        n_k: RINN controller state dimension.
+        n_w_rinn: RINN implicit-layer (hidden) dimension.
+        activation: RINN activation function ('relu' or 'leaky_relu').
+        u_max: Control saturation bound.
+        controller_limit: Controller state limits (list of n_k values).
+        m_b, m_t, L, rho_l: Flexible rod physical parameters.
+        lyapunov_parameters: Dict with Lyapunov function config.
+        output_C: Performance output matrix z = C_z * x_p.
+        verification_mode: 'combined', 'dissipativity', or 'invariance'.
+        kappa: Lyapunov decay rate (0 = simple stability).
+        supply_type: 'lyapunov' or 'l2gain'. L2-gain adds ||w||²-(1/γ²)||z||²
+            slack that makes CROWN verification tractable.
+        gamma: L2-gain bound (only used when supply_type='l2gain').
+        w_max: Box disturbance bound (only used when supply_type='l2gain'
+            and nominal=True for non-uncertainty L2-gain verification).
+    """
+    import neural_lyapunov_training.flexible_rod as flexible_rod_mod
+    from neural_lyapunov_training.uncertainty import TanhNormBallTransform
+    from neural_lyapunov_training.systems import LinearMeasurement
+
+    # -- plant dynamics (CT → DT via Euler) --
+    rod_ct = flexible_rod_mod.FlexibleRodDynamics(
+        m_b=m_b, m_t=m_t, L=L, rho_l=rho_l,
+        output_C=torch.tensor(output_C) if output_C is not None else None,
+    )
+    plant = dynamical_system.FirstOrderDiscreteTimeSystem(
+        rod_ct, dt=dt,
+        integration=dynamical_system.IntegrationMethod.ExplicitEuler,
+    )
+
+    n_plant = plant.nx  # 2
+    n_y = rod_ct.ny     # 1 (position measurement)
+    n_u = rod_ct.nu     # 1
+
+    # -- RINN controller (dummy matrices — CROWN overwrites from checkpoint) --
+    # output_fn: y = Cpy @ x_p (position-only measurement)
+    measurement_fn = LinearMeasurement(torch.zeros(n_y, n_plant))
+
+    rinn_ctrl = controllers.RINNController(
+        A=torch.zeros(n_k, n_k),
+        Bw=torch.zeros(n_k, n_w_rinn),
+        By=torch.zeros(n_k, n_y),
+        Cv=torch.zeros(n_w_rinn, n_k),
+        Dvw=torch.zeros(n_w_rinn, n_w_rinn),
+        Dvy=torch.zeros(n_w_rinn, n_y),
+        Cu=torch.zeros(n_u, n_k),
+        Duw=torch.zeros(n_u, n_w_rinn),
+        Duy=torch.zeros(n_u, n_y),
+        n_plant=n_plant,
+        dt=dt,
+        output_fn=measurement_fn,
+        trainable=True,
+        freeze_dvw_lower_tri=True,
+        activation=activation,
+        clip_output='clamp',
+        u_lo=torch.tensor([-u_max]),
+        u_up=torch.tensor([u_max]),
+    )
+
+    # -- augmented dynamics [x_p, x_k] --
+    aug_dyn = dynamical_system.AugmentedRINNDynamics(plant, rinn_ctrl)
+    nx = aug_dyn.nx  # n_plant + n_k
+
+    # -- Lyapunov function --
+    lp = dict(lyapunov_parameters or {})
+    if 'R_trainable' not in lp:
+        lp['R_trainable'] = torch.zeros(nx, nx)
+    if 'R_frozen' not in lp:
+        lp['R_frozen'] = torch.zeros(nx, nx)
+    lyap_nn = lyapunov.NeuralNetworkLyapunov(
+        goal_state=aug_dyn.x_equilibrium,
+        x_dim=nx,
+        **lp,
+    )
+
+    # -- Supply rate --
+    if supply_type == 'l2gain':
+        supply_fn = supply_rate.L2GainSupplyRate(gamma=gamma)
+    else:
+        supply_fn = supply_rate.LyapunovSupplyRate(kappa=kappa)
+
+    if nominal:
+        # Nominal verification: no uncertainty transform
+        # For L2-gain, still need w_max for the disturbance dimension
+        if supply_type == 'l2gain' and w_max > 0:
+            effective_w_max = torch.tensor([w_max])
+        else:
+            effective_w_max = torch.tensor([0.0])
+        loss_fn = lyapunov.DissipativityDerivativeLoss(
+            dynamics=aug_dyn,
+            controller=rinn_ctrl,
+            lyap_nn=lyap_nn,
+            supply_rate=supply_fn,
+            box_lo=torch.zeros(nx),
+            box_up=torch.zeros(nx),
+            rho_multiplier=1.0,
+            w_max=effective_w_max,
+            beta=100,
+            hard_max=True,
+            s_scale=s_scale,
+            relu_minmax=True,
+            verification_mode=verification_mode,
+            uncertainty_transform=None,
+        )
+    else:
+        # -- Tanh norm-ball uncertainty transform: w̃ → w --
+        uncertainty_xform = TanhNormBallTransform(
+            gamma_delta=gamma_delta,
+            n_w=rod_ct.nw,  # 1 (plant uncertainty dimension)
+            c_bar=c_bar,
+        )
+
+        # -- Dissipativity loss (the verification model) --
+        loss_fn = lyapunov.DissipativityDerivativeLoss(
+            dynamics=aug_dyn,
+            controller=rinn_ctrl,
+            lyap_nn=lyap_nn,
+            supply_rate=supply_fn,
+            box_lo=torch.zeros(nx),
+            box_up=torch.zeros(nx),
+            rho_multiplier=1.0,
+            w_max=torch.tensor([c_bar]),  # bounds on w̃ (for w̃-domain splitting)
+            beta=100,
+            hard_max=True,
+            s_scale=s_scale,
+            relu_minmax=True,
+            verification_mode=verification_mode,
+            uncertainty_transform=uncertainty_xform,
+        )
+
     loss_fn._fixed_rho = rho
 
-    # Return loss_fn directly — its forward() handles joint [ξ, w] input
-    # and ABCROWN loads weights via model.path config field.
     return loss_fn
 
 

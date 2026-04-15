@@ -617,6 +617,10 @@ def batch_train_lyapunov(
     if getattr(derivative_lyaloss, '_s_scale_learnable', False):
         params_dict.append({"params": [derivative_lyaloss._log_s_scale], "lr": lr})
         params.append(derivative_lyaloss._log_s_scale)
+    # If IQC lambda is learnable, add its log-space parameter to the optimizer.
+    if getattr(derivative_lyaloss, '_iqc_enabled', False) and getattr(derivative_lyaloss, '_learnable_iqc_lambda', False):
+        params_dict.append({"params": [derivative_lyaloss._log_iqc_lambda], "lr": lr})
+        params.append(derivative_lyaloss._log_iqc_lambda)
     optimizer = torch.optim.Adam(params_dict, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer, milestones=[int(epochs * 0.3), int(epochs * 0.6)], gamma=0.5
@@ -846,6 +850,8 @@ def batch_train_lyapunov(
                 )
             if getattr(derivative_lyaloss, '_s_scale_learnable', False):
                 print_msg += f"s_scale={derivative_lyaloss.get_s_scale_value():.4e}, "
+            if getattr(derivative_lyaloss, '_iqc_enabled', False):
+                print_msg += f"iqc_λ={derivative_lyaloss.get_iqc_lambda_value():.4e}, "
             if called_optimizer_step:
                 logger.info(print_msg)
             if buffer_loss == 0:
@@ -1265,6 +1271,14 @@ def train_lyapunov_with_buffer(
                     model_dict["rho"] = derivative_lyaloss.get_rho()
                 if hasattr(derivative_lyaloss, "get_s_scale_value"):
                     model_dict["s_scale"] = derivative_lyaloss.get_s_scale_value()
+                if getattr(derivative_lyaloss, '_iqc_enabled', False):
+                    model_dict["iqc_lambda"] = derivative_lyaloss.get_iqc_lambda_value()
+                # Precompute Cholesky factor for CROWN-friendly quadratic form
+                lyap = getattr(derivative_lyaloss, 'lyapunov', None)
+                if lyap is not None and hasattr(lyap, 'precompute_cholesky'):
+                    lyap.precompute_cholesky()
+                    model_dict["state_dict"] = derivative_lyaloss.state_dict()
+                    lyap.L_chol = None  # reset so training uses R-based path
                 torch.save(
                     model_dict,
                     save_best_model,
