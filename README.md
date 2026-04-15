@@ -56,10 +56,10 @@ Certifies an ℓ₂-gain bound γ=100 with disturbance bound d_max=0.075.
 
 ```bash
 # Trainable controller (Alg. 1 in paper)
-python examples/pendulum_state_training.py --config-name pendulum_baseline_formal
+python examples/pendulum_state_training.py --config-name pendulum_l2_gain_trainable_controller
 
 # Fixed controller (trains only the Lyapunov certificate)
-python examples/pendulum_state_training.py --config-name pendulum_baseline_fixed_ctrl
+python examples/pendulum_state_training.py --config-name pendulum_l2_gain_fixed_controller
 ```
 
 ### Experiment 2: Sector-bound model uncertainty
@@ -68,11 +68,17 @@ Certifies robustness to sector-bounded input uncertainty |δ(ũ)| ≤ α|ũ| wit
 
 ```bash
 # Trainable controller
-python examples/pendulum_state_training.py --config-name pendulum_sector_bound_nn32_verify_controller2
+python examples/pendulum_state_training.py --config-name pendulum_sector_bounded_uncertainty_trainable_controller
 
 # Fixed controller
-python examples/pendulum_state_training.py --config-name pendulum_sector_bound_nn32_verify
+python examples/pendulum_state_training.py --config-name pendulum_sector_bounded_uncertainty_fixed_controller
 ```
+
+The four paper experiment configs are standalone and self-contained:
+`pendulum_l2_gain_trainable_controller`,
+`pendulum_l2_gain_fixed_controller`,
+`pendulum_sector_bounded_uncertainty_trainable_controller`, and
+`pendulum_sector_bounded_uncertainty_fixed_controller`.
 
 Each run:
 1. Initializes the controller and Lyapunov function

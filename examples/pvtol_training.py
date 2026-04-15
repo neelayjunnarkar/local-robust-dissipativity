@@ -322,7 +322,7 @@ if __name__ == "__main__":
         save_lyaloss_path = f"{data_folder}/{save_name}"
 
     if arguments.Config["train"]["enable_wandb"]:
-        wandb.init(project="pvtol", entity="zshi")
+        wandb.init(project="pvtol")
         wandb.config.update(arguments.Config.all_args)
         wandb.run.name = f"{limit_scale}/{save_name}"
 

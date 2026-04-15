@@ -1,34 +1,23 @@
-# =============================================================================
-# Pendulum RINN — Sector-Bounded Uncertainty (bilinear, α=0.1)
-# =============================================================================
-# Certifies robustness to pointwise sector-bounded input uncertainty:
-#   u_actual = ũ + δ(ũ),    |δ(ũ)| ≤ α|ũ|
-#
-# Uses bilinear parameterization (no tanh, no abs):
-#   wp = α · ũ · w̃,    w̃ ∈ [−1, 1]
-#
-# CROWN-friendly: only BoundMul (McCormick envelopes), no tanh relaxation.
-# =============================================================================
-
-wandb_name: pendulum_sector_bound
-defaults:
-  - user: pendulum_state_training_default
-  - train_template
+wandb_name: pendulum_sector_bounded_uncertainty_trainable_controller
 
 hydra:
   run:
-    dir: ${user.run_dir}
+    dir: ./output/pendulum_state/${now:%Y-%m-%d}/${now:%H-%M-%S}
   sweep:
-    dir: ${user.run_dir}
+    dir: ./output/pendulum_state/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
-use_sdp_init: False
-
+seed: 6
 verify_init: True
-seed: 42
+verify_init_rho_tol: 0.0001
+verify_init_max_bisect: 20
+use_sdp_init: False
 use_init_roa_anchors: True
 init_roa_num_anchors: 1024
-init_roa_anchor_expand: 1.1
+init_roa_anchor_expand: 1.3
 init_roa_anchor_weight: 0.2
+pgd_verifier_steps: 350
+pgd_verifier_num_seeds: 5
+pgd_verifier_stop_early: False
 
 supply_rate:
   type: lyapunov
@@ -36,31 +25,24 @@ supply_rate:
     type: sector_bound
     alpha: 0.25
 
-pgd_verifier_steps: 350
-pgd_verifier_num_seeds: 5
-pgd_verifier_stop_early: False
-
 model:
+  load_lyaloss: null
+  save_lyaloss: True
   kappa: 0.0
   normalize_coordinates: False
-
   P_init: [[ 1.5211e-02,  1.1826e-03, -3.9104e-05,  7.0204e-05],
            [ 1.1826e-03,  1.1001e-03,  1.4486e-04,  5.6436e-05],
            [-3.9104e-05,  1.4486e-04,  1.3817e-02,  4.1302e-03],
            [ 7.0204e-05,  5.6436e-05,  4.1302e-03,  3.8687e-03]]
-
   K_init: null
-
   output_C: [[1.0, 0.0],
              [0.0, 1.0]]
-
   controller:
     type: rinn
     rinn:
       n_k: 2
       n_w: 8
       activation: relu
-
       A:   [[-3.1509, -1.4492],
             [-1.1005, -0.6330]]
       Bw:  [[ 0.0236, -0.0235, -0.0235,  0.0245,  0.0232, -0.0232,  0.0236, -0.0231],
@@ -94,34 +76,28 @@ model:
       Cu:  [[ 0.0906,  0.0395]]
       Duw: [[ 0.0342, -0.0338, -0.0340,  0.0353,  0.0343, -0.0346,  0.0338, -0.0344]]
       Duy: [[-2.7673, -2.1278]]
-
       controller_limit: [4, 4]
-      trainable: False
+      trainable: True
       freeze_dvw_lower_tri: True
-
   lyapunov:
     use_frozen_quadratic: True
     use_trainable_quadratic: True
     use_nonlinear: True
     activation: leaky_relu
-    hidden_widths: [128, 128]
+    hidden_widths: [32, 32]
     nn_scale: 0.25
     learnable_nn_scale: False
     absolute_output: True
-
   V_decrease_within_roa: True
-
   limit_scale: [1]
   domain_init_scale: auto
   domain_init_margin: 1.05
-  V_psd_form: "quadratic_times_tanh"
+  V_psd_form: quadratic_times_tanh
   rho_multiplier: [1]
   limit: [3, 9]
-
   dt: 0.01
-  velocity_integration: "ExplicitEuler"
-  position_integration: "MidPoint"
-
+  velocity_integration: ExplicitEuler
+  position_integration: MidPoint
   controller_nlayer: 2
   controller_hidden_dim: 32
   u_max: 0.750465
@@ -129,18 +105,27 @@ model:
 train:
   device: cuda
   train_lyaloss: True
+  wandb:
+    enabled: False
+    project: pendulum_rinn
+    name: ${now:%Y.%m.%d-%H.%M.%S}_${wandb_name}
+    dir: ${hydra:run.dir}
+    entity: null
+  lr_scheduler: False
   hard_max: True
   num_samples_per_boundary: 512
   batch_size: 65536
   epochs: 200
   learning_rate: 3e-4
+  lr_controller: 1e-3
   pgd_steps: 350
   Vmin_x_pgd_buffer_size: 65536
   buffer_size: 32768
   samples_per_iter: 16384
-
   max_iter: [200]
-
+  derivative_x_buffer_path: null
+  Vmin_x_pgd_path: null
+  update_Vmin_boundary_per_epoch: False
   domain_expansion: True
   domain_update_interval: 500
   domain_traj_steps: 1000
@@ -149,6 +134,10 @@ train:
   domain_max_growth: 1.5
 
 loss:
+  ibp_ratio_derivative: 0
+  sample_ratio_derivative: 1
+  ibp_ratio_positivity: 0
+  sample_ratio_positivity: 0
   s_scale: 1.0
   learnable_s_scale: False
   candidate_roa_states_weight: 0.1
@@ -165,7 +154,7 @@ formal_verification:
   verify_initial: True
   init_pure_quadratic: True
   verify_final: True
-  timeout: 300
+  timeout: 27000
   rho_eps: 0.1
   max_bisect_iters: 7
   hole_size: 0.01
@@ -175,8 +164,8 @@ formal_verification:
   device: cuda
   batch_size: 32768
   pgd_restarts: 10000
-  enable_incomplete_verification: false
-  extra_input_splits: 1
+  enable_incomplete_verification: True
+  extra_input_splits: 2
   domain_tightening: True
   tightening_samples: 500000
   tightening_margin: 1.05
