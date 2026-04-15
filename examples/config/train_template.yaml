@@ -1,5 +1,12 @@
 seed: 1234
 
+# Pre-training verification: find the largest verified rho with the initial
+# model (before any training), then plot initial vs trained ROA comparison.
+verify_init: False
+# Bisection tolerance (absolute rho) and max iterations for verify_init.
+verify_init_rho_tol: 0.0001
+verify_init_max_bisect: 20
+
 model:
   load_lyaloss: null
   save_lyaloss: True
@@ -13,11 +20,13 @@ model:
   V_psd_form: "L1"
 
 train:
+  # Device: "cpu", "cuda", or "auto" (use GPU if available)
+  device: auto
   # Train Lyapunov, controller and (maybe) observer
   train_lyaloss: False
   wandb:
     enabled: ${user.wandb_enabled}
-    project: neural_lyapunov_training
+    project: ${user.wandb_project}
     name: ${now:%Y.%m.%d-%H.%M.%S}_${wandb_name}
     dir: ${user.run_dir}
     entity: ${user.wandb_entity}
@@ -32,6 +41,10 @@ train:
   lr_controller: 1e-3
   # Number of steps in pgd attack
   pgd_steps: 50
+  # Final verifier settings
+  pgd_verifier_steps: 300
+  pgd_verifier_num_seeds: 5
+  pgd_verifier_stop_early: True
   # Size of the state buffer
   buffer_size: 10000
   # Size of each batch
@@ -48,6 +61,13 @@ train:
   Vmin_x_pgd_path: null
   # Update the candidate states min V(x) on the boundary after every epoch.
   update_Vmin_boundary_per_epoch: False
+  # --- Dynamic domain expansion (disabled by default) ---
+  domain_expansion: False
+  domain_update_interval: 10
+  domain_traj_steps: 200
+  domain_num_trajectories: 2000
+  domain_convergence_thresh: 0.01
+  domain_max_growth: 2.0
 
 loss:
   # Ratio of IBP loss
@@ -65,6 +85,17 @@ loss:
   # Weight for L1norm(θ) in the loss.
   l1_reg: 1e-3
   # weight for candidate states in ROA.
-  candidate_roa_states_weight: 0 
+  candidate_roa_states_weight: 0
 
-
+# =============================================================================
+# Formal Verification (α,β-CROWN) after training
+# =============================================================================
+# When enabled and PGD finds no counterexamples, runs formal verification
+# with bisection on ρ using the exact same training loss condition.
+formal_verification:
+  enabled: False
+  timeout: 200
+  rho_eps: 0.001
+  max_bisect_iters: 30
+  hole_size: 0.001
+  rho_multiplier: 1.2

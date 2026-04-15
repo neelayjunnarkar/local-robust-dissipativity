@@ -1,0 +1,90 @@
+# α,β-CROWN verification config for pendulum RINN state-feedback with
+# dissipativity (L2-gain) condition.
+#
+# ρ is baked into the model's min/max formulation.
+# VNNLIB specs just check output ≥ 0 (no external level-set constraint).
+#
+# Usage:
+#   cd verification && export CONFIG_PATH=$(pwd)
+#   cd complete_verifier
+#   python abcrown.py --config $CONFIG_PATH/pendulum_rinn_state_feedback_dissipativity.yaml
+#
+# The verify_dissipativity.py script generates this config dynamically
+# with the correct rho for bisection.
+
+general:
+  device: cpu
+  conv_mode: matrix
+  enable_incomplete_verification: false
+  root_path: ${CONFIG_PATH}
+  csv_name: specs/pendulum_rinn_dissipativity.csv
+model:
+  # Factory creates verification model with ρ baked in.
+  # Modify rho= to test different sublevel set values.
+  name: >-
+    Customized("../neural_lyapunov_training/models.py",
+    "create_pendulum_rinn_state_feedback_model",
+    dt=0.01, gamma=100.0, w_max=0.024525,
+    rho=0.069, s_scale=1.0,
+    rinn_parameters={
+      "A": [[-3.1509, -1.4492], [-1.1005, -0.633]],
+      "Bw": [[0.0236, -0.0235, -0.0235, 0.0245, 0.0232, -0.0232, 0.0236, -0.0231],
+             [0.0219, -0.0219, -0.0218, 0.0229, 0.0215, -0.0215, 0.0221, -0.0214]],
+      "By": [[-0.0151, 0.0151], [-0.0204, 0.0978]],
+      "Cv": [[0.0188, -0.0085], [-0.0185, 0.0083], [-0.0188, 0.0085],
+             [0.025, -0.0127], [0.021, -0.01], [-0.0193, 0.009],
+             [0.0228, -0.0111], [-0.0192, 0.009]],
+      "Dvw": [[0.0, -0.0327, -0.0327, 0.0348, 0.0327, -0.0323, 0.0332, -0.032],
+              [0.0, 0.0, 0.0327, -0.0348, -0.0327, 0.0323, -0.0332, 0.032],
+              [0.0, 0.0, 0.0, -0.0348, -0.0327, 0.0323, -0.0332, 0.032],
+              [0.0, 0.0, 0.0, 0.0, 0.0313, -0.0304, 0.0322, -0.0302],
+              [0.0, 0.0, 0.0, 0.0, 0.0, -0.0319, 0.0331, -0.0316],
+              [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.0333, 0.0321],
+              [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.0309],
+              [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+      "Dvy": [[-0.0063, 0.0235], [0.0065, -0.0234], [0.0063, -0.0235],
+              [-0.0072, 0.0275], [-0.0059, 0.0248], [0.0057, -0.0238],
+              [-0.0066, 0.0259], [0.0056, -0.0238]],
+      "Cu": [[0.0906, 0.0395]],
+      "Duw": [[0.0342, -0.0338, -0.034, 0.0353, 0.0343, -0.0346, 0.0338, -0.0344]],
+      "Duy": [[-2.7673, -2.1278]],
+      "activation": "relu",
+      "u_lo": [-0.24525],
+      "u_up": [0.24525]
+    },
+    lyapunov_parameters={
+      "hidden_widths": [128, 128],
+      "eps": 1e-06,
+      "V_psd_form": "quadratic_times_tanh",
+      "use_nonlinear": true,
+      "nn_scale": 0.5,
+      "activation": torch.nn.LeakyReLU
+    },
+    output_C=[[1.0, 0.0], [0.0, 1.0]])
+  path: ${CONFIG_PATH}/../output/pendulum_state/2026-03-14/11-27-45/lyaloss_1.pth
+  input_shape: [-1, 5]   # [xi(4), w(1)]
+data:
+  dataset: >-
+    Customized("models.py", "box_data",
+    lower_limit=[-0.6, -2.0, -1.0, -1.0, -0.024525],
+    upper_limit=[0.6, 2.0, 1.0, 1.0, 0.024525],
+    ndim=5, scale=1.0, hole_size=0.0)
+attack:
+  pgd_order: skip
+solver:
+  batch_size: 1000
+  min_batch_size_ratio: 0.
+  bound_prop_method: crown
+bab:
+  override_timeout: 100000000
+  decision_thresh: -1.e-6
+  branching:
+    method: sb
+    input_split:
+      enable: True
+      ibp_enhancement: True
+      compare_with_old_bounds: True
+      adv_check: -1
+      sb_coeff_thresh: 0.001
+
+    I want you to first read the papaer rigorously and summarize it, then rigorusly implement the model in our framework cleanly. I want you to make everything as general as possible as we want to add more xoeriemtns later, add this to 

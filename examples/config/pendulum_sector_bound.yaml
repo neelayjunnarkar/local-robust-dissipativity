@@ -1,17 +1,16 @@
 # =============================================================================
-# Pendulum RINN Baseline — quadratic×tanh Lyapunov, [32,32] NN
+# Pendulum RINN — Sector-Bounded Uncertainty (bilinear, α=0.1)
 # =============================================================================
-# Best configuration from formal verification experiments (qt_nn32_fns_tc).
-# Results: init_crown=0.431, final_crown=0.932, final_pgd=1.017
+# Certifies robustness to pointwise sector-bounded input uncertainty:
+#   u_actual = ũ + δ(ũ),    |δ(ũ)| ≤ α|ũ|
 #
-# V(x) = x^T P x · (1 + 0.5·tanh(NN(x)))   with NN = [32,32] LeakyReLU
-# Controller: RINN n_w=8 ReLU, trainable (CROWN-friendly)
-# Lyapunov: frozen quadratic + trainable quadratic + nonlinear tanh
-# Training domain: θ∈[-3,3], θ̇∈[-9,9], controller limit: [-4,4]
-# Formal verification enabled (CROWN + PGD bisection)
+# Uses bilinear parameterization (no tanh, no abs):
+#   wp = α · ũ · w̃,    w̃ ∈ [−1, 1]
+#
+# CROWN-friendly: only BoundMul (McCormick envelopes), no tanh relaxation.
 # =============================================================================
 
-wandb_name: pendulum_baseline_fixed_ctrl
+wandb_name: pendulum_sector_bound
 defaults:
   - user: pendulum_state_training_default
   - train_template
@@ -25,22 +24,24 @@ hydra:
 use_sdp_init: False
 
 verify_init: True
-seed: 3
-
+seed: 42
 use_init_roa_anchors: True
 init_roa_num_anchors: 1024
-init_roa_anchor_expand: 1.2
-init_roa_anchor_weight: 0.1
+init_roa_anchor_expand: 1.1
+init_roa_anchor_weight: 0.2
 
 supply_rate:
-  type: l2gain
-  gamma: 100
-  d_max: 0.0750465
+  type: lyapunov
+  uncertainty:
+    type: sector_bound
+    alpha: 0.25
+
 pgd_verifier_steps: 350
-pgd_verifier_num_seeds: 3
+pgd_verifier_num_seeds: 5
 pgd_verifier_stop_early: False
 
 model:
+  kappa: 0.0
   normalize_coordinates: False
 
   P_init: [[ 1.5211e-02,  1.1826e-03, -3.9104e-05,  7.0204e-05],
@@ -104,7 +105,7 @@ model:
     use_nonlinear: True
     activation: leaky_relu
     hidden_widths: [128, 128]
-    nn_scale: 0.5
+    nn_scale: 0.25
     learnable_nn_scale: False
     absolute_output: True
 
@@ -130,26 +131,26 @@ train:
   train_lyaloss: True
   hard_max: True
   num_samples_per_boundary: 512
-  batch_size: 131072
+  batch_size: 65536
   epochs: 200
-  learning_rate: 1e-3
-  pgd_steps: 300
-  Vmin_x_pgd_buffer_size: 131072
-  buffer_size: 65536
-  samples_per_iter: 32768
+  learning_rate: 3e-4
+  pgd_steps: 350
+  Vmin_x_pgd_buffer_size: 65536
+  buffer_size: 32768
+  samples_per_iter: 16384
 
   max_iter: [200]
 
   domain_expansion: True
   domain_update_interval: 500
   domain_traj_steps: 1000
-  domain_num_trajectories: 5000
+  domain_num_trajectories: 2000
   domain_convergence_thresh: 0.01
   domain_max_growth: 1.5
 
 loss:
   s_scale: 1.0
-  learnable_s_scale: True
+  learnable_s_scale: False
   candidate_roa_states_weight: 0.1
   l1_reg: 0
   Vmin_x_boundary_weight: 0.0
@@ -159,24 +160,23 @@ loss:
   always_candidate_roa_regulizer: True
   c1_threshold: 0.0
 
-# =============================================================================
-# Formal Verification — GPU-accelerated CROWN + PGD bisection
-# =============================================================================
 formal_verification:
   enabled: True
   verify_initial: True
   init_pure_quadratic: True
   verify_final: True
-  timeout: 240
-  rho_eps: 0.05
-  max_bisect_iters: 5
-  hole_size: 0.1
-  rho_multiplier: 1.15
+  timeout: 300
+  rho_eps: 0.1
+  max_bisect_iters: 7
+  hole_size: 0.01
+  smart_bracket: True
+  bracket_shift: 0.9
+  rho_multiplier: 1.1
   device: cuda
   batch_size: 32768
-  smart_bracket: True
-  bracket_shift: 0.95
   pgd_restarts: 10000
+  enable_incomplete_verification: false
+  extra_input_splits: 1
   domain_tightening: True
   tightening_samples: 500000
   tightening_margin: 1.05

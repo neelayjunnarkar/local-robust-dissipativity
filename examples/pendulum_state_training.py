@@ -8,7 +8,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 from omegaconf import DictConfig, OmegaConf, ListConfig
 import random
-import scipy.linalg
 import torch
 import torch.nn as nn
 import wandb
@@ -19,7 +18,9 @@ import neural_lyapunov_training.lyapunov as lyapunov
 import neural_lyapunov_training.models as models
 import neural_lyapunov_training.pendulum as pendulum
 import neural_lyapunov_training.supply_rate as supply_rate_module
+import neural_lyapunov_training.systems as systems_module
 import neural_lyapunov_training.train_utils as train_utils
+import neural_lyapunov_training.uncertainty as uncertainty_module
 
 device = torch.device("cpu")
 dtype = torch.float
@@ -34,9 +35,12 @@ def create_supply_rate(cfg, kappa: float) -> supply_rate_module.SupplyRate:
     if not hasattr(cfg, 'supply_rate') or cfg.supply_rate is None:
         return supply_rate_module.LyapunovSupplyRate(kappa=kappa)
     
-    supply_type = cfg.supply_rate.get('type', 'lyapunov').lower()
+    supply_type = cfg.supply_rate.get('type', 'lyapunov')
+    if supply_type is None:
+        supply_type = 'lyapunov'
+    supply_type = str(supply_type).lower()
     
-    if supply_type == 'lyapunov':
+    if supply_type in ('lyapunov', 'none'):
         return supply_rate_module.LyapunovSupplyRate(kappa=kappa)
     elif supply_type == 'l2gain':
         return supply_rate_module.L2GainSupplyRate(gamma=cfg.supply_rate.get('gamma', 1.0))
@@ -53,12 +57,155 @@ def get_val(val, n):
 
 
 def get_w_max(cfg):
-    """Get disturbance bound from config."""
-    if hasattr(cfg, 'supply_rate') and cfg.supply_rate is not None:
-        w_max = cfg.supply_rate.get('w_max', None)
-        if w_max is not None:
-            return torch.tensor([w_max])
+    """Get disturbance/uncertainty bound from config.
+
+    The bound comes from two independent sources:
+      1. Exogenous disturbance (L2-gain): supply_rate.d_max or supply_rate.w_max
+         — only when the supply rate *requires* disturbance (L2-gain, passivity)
+      2. Uncertainty (IQC/disk margin): supply_rate.uncertainty.w_bound
+         — only when an uncertainty block is configured
+
+    Returns None when neither is active (pure Lyapunov, no uncertainty).
+    """
+    if not hasattr(cfg, 'supply_rate') or cfg.supply_rate is None:
+        return None
+
+    sr = cfg.supply_rate
+    sr_type = sr.get('type', 'lyapunov').lower()
+
+    # 1) Exogenous disturbance bound (for L2-gain / passivity supply rates)
+    if sr_type in ('l2gain', 'passivity'):
+        d_max = sr.get('d_max', sr.get('w_max', None))
+        if d_max is not None:
+            return torch.tensor([d_max])
+        return None
+
+    # 2) Uncertainty bound (IQC mode)
+    unc_cfg = sr.get('uncertainty', None)
+    if unc_cfg is not None:
+        unc_type = unc_cfg.get('type', 'box').lower()
+
+        if unc_type == 'iqc':
+            w_bound = unc_cfg.get('w_bound', None)
+            if w_bound is not None:
+                return torch.tensor([w_bound])
+            # Derive from α and controller limit: |w| ≤ α·u_max/(1−α·β)
+            iqc_cfg = unc_cfg.get('iqc', {})
+            alpha = iqc_cfg.get('alpha', 0.353)
+            sigma = iqc_cfg.get('sigma', 0.0)
+            beta = (1.0 + sigma) / 2.0
+            ctrl_limit = cfg.model.get('controller_limit', None)
+            u_max = cfg.model.get('u_max', None)
+            if ctrl_limit is not None:
+                u_max_val = max(ctrl_limit) if isinstance(ctrl_limit, (list, tuple)) else float(ctrl_limit)
+            elif u_max is not None:
+                u_max_val = float(u_max)
+            else:
+                return None
+            w_bar = alpha * u_max_val / (1.0 - alpha * beta)
+            return torch.tensor([w_bar])
+
+        if unc_type == 'disk_margin':
+            c_bar = unc_cfg.get('c_bar', 3.0)
+            return torch.tensor([c_bar])
+
+        if unc_type == 'tanh_norm_ball':
+            c_bar = unc_cfg.get('c_bar', 3.0)
+            return torch.tensor([c_bar])
+
+        # box uncertainty
+        box_w = sr.get('d_max', sr.get('w_max', None))
+        if box_w is not None:
+            return torch.tensor([box_w])
+
+    # Pure Lyapunov without uncertainty — no disturbance
     return None
+
+
+def create_uncertainty_transform(cfg, nw: int = 1):
+    """Create uncertainty transform from config.
+
+    Returns (transform, w_tilde_bound) where:
+      - transform: nn.Module  (v, w̃) → w,  or None for box-bounded
+      - w_tilde_bound: float  bound for the free parameter w̃
+    """
+    if not hasattr(cfg, 'supply_rate') or cfg.supply_rate is None:
+        return None, None
+
+    unc_cfg = cfg.supply_rate.get('uncertainty', None)
+    if unc_cfg is None:
+        return None, None
+
+    unc_type = unc_cfg.get('type', 'box').lower()
+    if unc_type in ('box', 'iqc'):
+        return None, None  # IQC uses direct box bounds on w, no transform
+
+    if unc_type == 'tanh_norm_ball':
+        gamma_delta = unc_cfg.get('gamma_delta', 0.1)
+        c_bar = unc_cfg.get('c_bar', 3.0)
+        epsilon = unc_cfg.get('epsilon', 1e-6)
+        transform = uncertainty_module.TanhNormBallTransform(
+            gamma_delta=gamma_delta, n_w=nw, c_bar=c_bar, epsilon=epsilon,
+        )
+        return transform, c_bar
+
+    if unc_type == 'disk_margin':
+        alpha = unc_cfg.get('alpha', 0.353)
+        sigma = unc_cfg.get('sigma', 0.0)
+        c_bar = unc_cfg.get('c_bar', 3.0)
+        transform = uncertainty_module.DiskMarginTransform(
+            alpha=alpha, sigma=sigma, c_bar=c_bar,
+        )
+        return transform, c_bar
+
+    if unc_type == 'sector_bound':
+        alpha = unc_cfg.get('alpha', 0.353)
+        transform = uncertainty_module.SectorBoundTransform(alpha=alpha)
+        return transform, 1.0
+
+    raise ValueError(f"Unknown uncertainty type: {unc_type}")
+
+
+def create_iqc_params(cfg):
+    """Create IQC multiplier parameters from config.
+
+    Returns dict with keys: iqc_M, iqc_z_fn, iqc_lambda_init, learnable_iqc_lambda
+    or empty dict if IQC is not configured.
+    """
+    if not hasattr(cfg, 'supply_rate') or cfg.supply_rate is None:
+        return {}
+
+    unc_cfg = cfg.supply_rate.get('uncertainty', None)
+    if unc_cfg is None:
+        return {}
+
+    unc_type = unc_cfg.get('type', 'box').lower()
+    if unc_type != 'iqc':
+        return {}
+
+    iqc_cfg = unc_cfg.get('iqc', {})
+    iqc_type = iqc_cfg.get('type', 'disk_margin').lower()
+
+    if iqc_type == 'disk_margin':
+        alpha = iqc_cfg.get('alpha', 0.353)
+        sigma = iqc_cfg.get('sigma', 0.0)
+        M = uncertainty_module.disk_margin_iqc_M(alpha)
+        z_fn = uncertainty_module.disk_margin_iqc_z_fn(sigma)
+    elif iqc_type == 'custom':
+        M = torch.tensor(iqc_cfg['M'], dtype=torch.float32)
+        z_fn = None  # default z = (u, w)
+    else:
+        raise ValueError(f"Unknown IQC type: {iqc_type}")
+
+    lambda_init = float(iqc_cfg.get('lambda_init', 1.0))
+    learnable = bool(iqc_cfg.get('learnable_lambda', True))
+
+    return {
+        'iqc_M': M,
+        'iqc_z_fn': z_fn,
+        'iqc_lambda_init': lambda_init,
+        'learnable_iqc_lambda': learnable,
+    }
 
 
 @torch.no_grad()
@@ -343,58 +490,6 @@ def roa_bounding_box(
     return half
 
 
-def linearize_pendulum(pendulum_continuous: pendulum.PendulumDynamics):
-    x = torch.tensor([[0.0, 0.0]])
-    x.requires_grad = True
-    u = torch.tensor([[0.0]])
-    u.requires_grad = True
-    qddot = pendulum_continuous.forward(x, u)
-    A = torch.empty((2, 2))
-    B = torch.empty((2, 1))
-    A[0, 0] = 0
-    A[0, 1] = 1
-    B[0, 0] = 0
-    A[1], B[1] = torch.autograd.grad(qddot[0, 0], [x, u])
-    return A, B
-
-
-def compute_lqr(pendulum_continuous: pendulum.PendulumDynamics):
-    A, B = linearize_pendulum(pendulum_continuous)
-    A_np, B_np = A.detach().numpy(), B.detach().numpy()
-    Q = np.eye(2)
-    R = np.eye(1) * 100
-    S = scipy.linalg.solve_continuous_are(A_np, B_np, Q, R)
-    K = -np.linalg.solve(R, B_np.T @ S)
-    return K, S
-
-
-def approximate_lqr(
-    pendulum_continuous: pendulum.PendulumDynamics,
-    controller: controllers.NeuralNetworkController,
-    lyapunov_nn: lyapunov.NeuralNetworkLyapunov,
-    upper_limit: torch.Tensor,
-    logger,
-):
-    K, S = compute_lqr(pendulum_continuous)
-    K_torch = torch.from_numpy(K).type(dtype).to(device)
-    S_torch = torch.from_numpy(S).type(dtype).to(device)
-    x = (torch.rand((100000, 2), dtype=dtype, device=device) - 0.5) * 2 * upper_limit
-    V = torch.sum(x * (x @ S_torch), axis=1, keepdim=True)
-    u = x @ K_torch.T
-
-    def approximate(system, system_input, target, lr, max_iter):
-        optimizer = torch.optim.Adam(system.parameters(), lr=lr)
-        for i in range(max_iter):
-            optimizer.zero_grad()
-            output = torch.nn.MSELoss()(system.forward(system_input), target)
-            logger.info(f"iter {i}, loss {output.item()}")
-            output.backward()
-            optimizer.step()
-
-    approximate(controller, x, u, lr=0.01, max_iter=500)
-    approximate(lyapunov_nn, x, V, lr=0.01, max_iter=1000)
-
-
 ACTIVATION_MAP = {
     "relu": nn.ReLU,
     "leaky_relu": nn.LeakyReLU,
@@ -427,6 +522,8 @@ def pgd_find_verified_rho(
     logger=None,
     c1_threshold=0.0,
     c1_multiplier=0.0,
+    uncertainty_transform=None,
+    **iqc_kwargs,
 ):
     """Find the largest PGD-verified rho for the current model state.
 
@@ -484,10 +581,13 @@ def pgd_find_verified_rho(
             rho_multiplier=rho_mult,
             w_max=w_max, hard_max=True, s_scale=s_scale,
             c1_threshold=c1_threshold, c1_multiplier=c1_multiplier,
+            uncertainty_transform=uncertainty_transform,
+            **iqc_kwargs,
         )
         loss_fn.x_boundary = x_boundary
 
-        use_adv_w = supply_rate.requires_disturbance and w_max is not None
+        use_adv_w = (supply_rate.requires_disturbance or uncertainty_transform is not None
+                     or iqc_kwargs.get('iqc_M', None) is not None) and w_max is not None
         if use_adv_w:
             nw = getattr(dynamics.continuous_time_system, 'nw', 1) if hasattr(dynamics, 'continuous_time_system') else 1
             ver_loss = lyapunov.DissipativityVerificationWrapper(loss_fn, nx, nw)
@@ -524,8 +624,9 @@ def pgd_find_verified_rho(
             adv_out = torch.clamp(-ver_loss(adv_x), min=0.0)
             # Threshold scales with max_rho so normalised P (small V values)
             # doesn't hide violations behind a fixed 1e-4 cutoff.
-            violation_tol = 0
-            # max(1e-9, max_rho * 1e-3)
+            # Use a small absolute floor (1e-7) to absorb fp32 numerical noise
+            # plus a relative term for larger rho values.
+            violation_tol = max(1e-7, max_rho * 1e-4)
             if adv_out.max().item() > violation_tol:
                 return False
         return True
@@ -1237,10 +1338,22 @@ def run_crown_verification(
     logger.info("=" * 60)
 
     try:
+        import copy as _copy
         training_cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+        # Optional: reduce c_bar for verification (smaller → tighter CROWN bounds)
+        _verify_c_bar = formal_cfg.get("verify_c_bar", None)
+        if _verify_c_bar is not None:
+            training_cfg_dict = _copy.deepcopy(training_cfg_dict)
+            training_cfg_dict.setdefault("supply_rate", {}).setdefault("uncertainty", {})["c_bar"] = _verify_c_bar
+            logger.info(f"  [verify] Overriding c_bar={_verify_c_bar} for CROWN verification")
+        _verify_nominal = formal_cfg.get("verify_nominal", False)
+        _formal_init_rho = formal_cfg.get("formal_init_rho", None)
+        _effective_init_rho = float(_formal_init_rho) if _formal_init_rho is not None else init_rho
+        if _formal_init_rho is not None:
+            logger.info(f"  [verify] Using formal_init_rho={_effective_init_rho} (PGD rho={init_rho:.2f})")
         result = run_verification(
             training_dir=os.getcwd(),
-            init_rho=init_rho,
+            init_rho=_effective_init_rho,
             training_cfg=training_cfg_dict,
             logger=logger,
             timeout=formal_cfg.get("timeout", 200),
@@ -1260,6 +1373,10 @@ def run_crown_verification(
             domain_tightening=formal_cfg.get("domain_tightening", True),
             tightening_samples=formal_cfg.get("tightening_samples", 500000),
             tightening_margin=formal_cfg.get("tightening_margin", 1.05),
+            verify_nominal=_verify_nominal,
+            verify_c_bar=_verify_c_bar,
+            enable_incomplete_verification=formal_cfg.get("enable_incomplete_verification", False),
+            extra_input_splits=formal_cfg.get("extra_input_splits", 2),
         )
 
         if result["success"]:
@@ -1515,27 +1632,12 @@ def main(cfg: DictConfig):
 
     train_utils.set_seed(cfg.seed)
 
+    # ─── System construction (generic via system factory) ────────────────
+    dynamics, state_labels_plant, system_output_fn, continuous_sys = \
+        systems_module.create_system(cfg, device=device, dtype=dtype)
+    # Backward compat: keep references used downstream
+    pendulum_continuous = continuous_sys
     dt = cfg.model.dt
-    output_C = cfg.model.get('output_C', None)
-    output_D = cfg.model.get('output_D', None)
-    if output_C is not None:
-        output_C = torch.tensor(output_C, dtype=dtype, device=device)
-    if output_D is not None:
-        output_D = torch.tensor(output_D, dtype=dtype, device=device)
-
-    pendulum_continuous = pendulum.PendulumDynamics(
-        m=0.15, l=0.5, beta=0.1, output_C=output_C, output_D=output_D
-    )
-    dynamics = dynamical_system.SecondOrderDiscreteTimeSystem(
-        pendulum_continuous,
-        dt=dt,
-        position_integration=dynamical_system.IntegrationMethod[
-            cfg.model.position_integration
-        ],
-        velocity_integration=dynamical_system.IntegrationMethod[
-            cfg.model.velocity_integration
-        ],
-    )
 
     logger = logging.getLogger(__name__)
 
@@ -1662,7 +1764,7 @@ def main(cfg: DictConfig):
             A_k=A_k, B_k=B_k, C_k=C_k, D_k=D_k,
             n_plant=n_plant,
             dt=dt,
-            output_fn=None,  # full-state: y = x_p
+            output_fn=system_output_fn,
             trainable=ltic_trainable,
             clip_output='clamp' if cfg.model.u_max else None,
             u_lo=torch.tensor([-cfg.model.u_max], dtype=dtype, device=device) if cfg.model.u_max else None,
@@ -1738,7 +1840,7 @@ def main(cfg: DictConfig):
             Cu=Cu_r, Duw=Duw_r, Duy=Duy_r,
             n_plant=n_plant,
             dt=dt,
-            output_fn=None,  # full-state: y = x_p
+            output_fn=system_output_fn,
             trainable=rinn_trainable,
             freeze_dvw_lower_tri=rinn_freeze_dvw_lower,
             activation=rinn_activation,
@@ -1955,6 +2057,34 @@ def main(cfg: DictConfig):
     rho_multiplier = cfg.model.rho_multiplier
     supply_rate = create_supply_rate(cfg, kappa)
     w_max = get_w_max(cfg)
+
+    # Uncertainty transform (e.g. tanh norm-ball for IQC / L2-gain)
+    nw = getattr(dynamics, 'nw', 0) or 1
+    uncertainty_transform, w_tilde_bound = create_uncertainty_transform(cfg, nw=nw)
+    # When using a state-dependent transform, PGD optimizes w̃ in [-c̄, c̄]
+    # instead of w in [-w_max, w_max]; override w_max for PGD bounds.
+    if uncertainty_transform is not None:
+        uncertainty_transform = uncertainty_transform.to(device)
+        if w_max is None:
+            w_max = torch.tensor([w_tilde_bound])
+        else:
+            w_max = torch.tensor([w_tilde_bound])
+        xform_name = type(uncertainty_transform).__name__
+        if hasattr(uncertainty_transform, 'gamma_delta'):
+            logger.info(
+                f"Uncertainty transform: {xform_name} "
+                f"(γ_Δ={uncertainty_transform.gamma_delta}, c̄={w_tilde_bound}, "
+                f"coverage={uncertainty_transform.coverage_fraction():.3f})"
+            )
+        elif hasattr(uncertainty_transform, 'alpha'):
+            sigma_str = f", σ={uncertainty_transform.sigma}" if hasattr(uncertainty_transform, 'sigma') else ""
+            logger.info(
+                f"Uncertainty transform: {xform_name} "
+                f"(α={uncertainty_transform.alpha}{sigma_str}, "
+                f"c̄={w_tilde_bound}, coverage={uncertainty_transform.coverage_fraction():.3f})"
+            )
+        else:
+            logger.info(f"Uncertainty transform: {xform_name} (c̄={w_tilde_bound})")
     
     logger.info(f"Using supply rate: {type(supply_rate).__name__}")
     if w_max is not None:
@@ -1986,6 +2116,13 @@ def main(cfg: DictConfig):
     c1_threshold = cfg.loss.get('c1_threshold', 0.0)
     c1_multiplier = cfg.loss.get('c1_multiplier', 0.0)
 
+    # IQC multiplier parameters (Theorem 1)
+    iqc_params = create_iqc_params(cfg)
+    if iqc_params:
+        logger.info(f"IQC mode enabled: M shape={iqc_params['iqc_M'].shape}, "
+                     f"λ_init={iqc_params['iqc_lambda_init']:.4f}, "
+                     f"learnable={iqc_params['learnable_iqc_lambda']}")
+
     derivative_lyaloss = lyapunov.DissipativityDerivativeLoss(
         dynamics,
         controller,
@@ -2000,26 +2137,16 @@ def main(cfg: DictConfig):
         learnable_s_scale=learnable_s_scale,
         c1_threshold=c1_threshold,
         c1_multiplier=c1_multiplier,
+        uncertainty_transform=uncertainty_transform,
+        **iqc_params,
     )
 
     dynamics.to(device)
     controller.to(device)
     lyapunov_nn.to(device)
     grid_size = torch.tensor([50] * nx, device=device)
-    if cfg.approximate_lqr:
-        rho_mult_init = get_val(rho_multiplier, 0)
-        limit_scale_init = get_val(cfg.model.limit_scale, 0)
-        limit = limit_scale_init * model_limit
-        upper_limit = limit
-        approximate_lqr(
-            pendulum_continuous, controller, lyapunov_nn, upper_limit, logger
-        )
-        torch.save(
-            {"state_dict": derivative_lyaloss.state_dict()},
-            os.path.join(os.getcwd(), "lyaloss_lqr.pth"),
-        )
 
-    if not cfg.approximate_lqr and cfg.model.load_lyaloss is not None:
+    if cfg.model.load_lyaloss is not None:
         load_lyaloss = os.path.join(
             os.path.dirname(__file__), "../", cfg.model.load_lyaloss
         )
@@ -2046,16 +2173,14 @@ def main(cfg: DictConfig):
     # ── State labels (needed by both pre-training and post-training plots) ─
     if controller_type == 'ltic':
         _nk_sl = ltic_cfg.get('n_k', 0)
-        _plant_labels = [r"$\theta$ (rad)", r"$\dot{\theta}$ (rad/s)"]
         _ctrl_labels  = [rf"$x_{{k{i+1}}}$" for i in range(_nk_sl)]
-        state_labels  = (_plant_labels + _ctrl_labels)[:nx]
+        state_labels  = (state_labels_plant + _ctrl_labels)[:nx]
     elif controller_type == 'rinn':
         _nk_sl = cfg.model.controller.rinn.get('n_k', 0)
-        _plant_labels = [r"$\theta$ (rad)", r"$\dot{\theta}$ (rad/s)"]
         _ctrl_labels  = [rf"$x_{{k{i+1}}}$" for i in range(_nk_sl)]
-        state_labels  = (_plant_labels + _ctrl_labels)[:nx]
+        state_labels  = (state_labels_plant + _ctrl_labels)[:nx]
     else:
-        state_labels = [r"$\theta$ (rad)", r"$\dot{\theta}$ (rad/s)"][:nx]
+        state_labels = state_labels_plant[:nx]
 
     # =====================================================================
     # Quadratic imitation pre-training for pure-NN Lyapunov forms
@@ -2128,6 +2253,8 @@ def main(cfg: DictConfig):
             max_bisect_iters=cfg.get('verify_init_max_bisect', 20),
             logger=logger,
             c1_threshold=c1_threshold, c1_multiplier=c1_multiplier,
+            uncertainty_transform=uncertainty_transform,
+            **iqc_params,
         )
 
         logger.info(f"Initial verified rho: {init_rho:.6f}  (max_rho={init_max_rho:.6f})")
@@ -2236,6 +2363,10 @@ def main(cfg: DictConfig):
         _rng_state_np = np.random.get_state()
         _rng_state_py = random.getstate()
 
+        # Precompute Cholesky factor for CROWN-friendly quadratic form
+        if hasattr(lyapunov_nn, 'precompute_cholesky'):
+            lyapunov_nn.precompute_cholesky()
+
         # Save initial checkpoint for CROWN
         init_pth_path = os.path.join(os.getcwd(), "lyaloss_init.pth")
         torch.save(
@@ -2244,6 +2375,10 @@ def main(cfg: DictConfig):
              "s_scale": derivative_lyaloss.get_s_scale_value()},
             init_pth_path,
         )
+
+        # Reset L_chol so training uses the R-based path (gradients through R_trainable)
+        if hasattr(lyapunov_nn, 'L_chol'):
+            lyapunov_nn.L_chol = None
         init_crown_rho = run_crown_verification(
             cfg, formal_cfg, derivative_lyaloss, init_rho, logger,
             label="initial (pre-training)",
@@ -2283,6 +2418,8 @@ def main(cfg: DictConfig):
                 learnable_s_scale=learnable_s_scale,
                 c1_threshold=c1_threshold,
                 c1_multiplier=c1_multiplier,
+                uncertainty_transform=uncertainty_transform,
+                **iqc_params,
             )
 
             # When domain_expansion is active, optionally override the initial
@@ -2436,6 +2573,10 @@ def main(cfg: DictConfig):
                 lower_limit = _train_ret.lower_limit
                 upper_limit = _train_ret.upper_limit
 
+        # Precompute Cholesky factor for CROWN-friendly quadratic form
+        if hasattr(lyapunov_nn, 'precompute_cholesky'):
+            lyapunov_nn.precompute_cholesky()
+
         torch.save(
             {
                 "state_dict": lyapunov_nn.state_dict(),
@@ -2473,6 +2614,7 @@ def main(cfg: DictConfig):
         s_scale=derivative_lyaloss.get_s_scale_value(),
         c1_threshold=derivative_lyaloss.c1_threshold,
         c1_multiplier=c1_multiplier,
+        uncertainty_transform=uncertainty_transform,
     )
     
     use_adversarial_w = supply_rate.requires_disturbance and w_max is not None
@@ -2555,8 +2697,12 @@ def main(cfg: DictConfig):
         f"PGD verifier finds counter examples? {pgd_verifier_find_counterexamples}"
     )
 
+    # Trajectory steps scaled to dt (default ~5 seconds of sim time)
+    dt_val = cfg.model.get('dt', 0.01)
+    vis_traj_steps = cfg.train.get('vis_traj_steps', max(500, int(5.0 / dt_val)))
+
     x0 = (torch.rand((40, nx), device=device) - 0.5) * 2 * limit
-    x_traj, V_traj = models.simulate(derivative_lyaloss, 500, x0)
+    x_traj, V_traj = models.simulate(derivative_lyaloss, vis_traj_steps, x0)
     plt.plot(torch.stack(V_traj).cpu().detach().squeeze().numpy())
     vtraj_path = os.path.join(os.getcwd(), "Vtraj_roa.png")
     plt.savefig(vtraj_path)
@@ -2620,14 +2766,14 @@ def main(cfg: DictConfig):
         ic_all  = torch.cat([ic_plant, ic_ctrl], dim=1)
     else:
         ic_all = ic_plant
-    traj_tensor = simulate_closed_loop(dynamics, controller, ic_all, max_steps=400)
+    traj_tensor = simulate_closed_loop(dynamics, controller, ic_all, max_steps=vis_traj_steps)
     # traj_tensor: (T+1, N, nx)
 
     # ── Effective P matrix for final model ───────────────────────────────
     P_final_eff = get_effective_P(lyapunov_nn, device=device)
     P_final_np = P_final_eff.cpu().numpy() if P_final_eff is not None else None
 
-    # ── ROA projection plot (trained model) ──────────────────────────────
+    # ── Provisional trained-model plots (before final PGD verification) ──
     if rho > 0:
         fig_heat = plot_ellipsoid_projections(
             P_init=None, rho_init=0.0,
@@ -2639,14 +2785,14 @@ def main(cfg: DictConfig):
             lower_limit_tensor=lower_limit,
             upper_limit_tensor=upper_limit,
         )
-        heatmap_path = os.path.join(os.getcwd(), "V_roa.png")
+        heatmap_path = os.path.join(os.getcwd(), "V_roa_training.png")
         fig_heat.savefig(heatmap_path, dpi=150)
         plt.close(fig_heat)
-        logger.info(f"ROA projection plot saved: {heatmap_path}")
+        logger.info(f"Provisional ROA projection plot saved: {heatmap_path}")
     else:
         heatmap_path = None
 
-    # ── Flow field (vector field) plot ───────────────────────────────────
+    # ── Provisional flow field (before final PGD verification) ───────────
     fig_flow = plot_flow_field(
         dynamics=dynamics,
         controller=controller,
@@ -2658,10 +2804,10 @@ def main(cfg: DictConfig):
         trajectories=traj_tensor,
         title=f"Closed-Loop Flow Field  (ρ={rho:.5f})",
     )
-    flow_path = os.path.join(os.getcwd(), "flow_field.png")
+    flow_path = os.path.join(os.getcwd(), "flow_field_training.png")
     fig_flow.savefig(flow_path, dpi=150)
     plt.close(fig_flow)
-    logger.info(f"Flow field plot saved: {flow_path}")
+    logger.info(f"Provisional flow field plot saved: {flow_path}")
     if cfg.train.wandb.enabled:
         wandb.log({"flow_field": wandb.Image(flow_path)})
 
@@ -2679,7 +2825,8 @@ def main(cfg: DictConfig):
 
         # ── Reconstruct initial model ─────────────────────────────────────
         lyapunov_init = copy.deepcopy(lyapunov_nn)
-        lyapunov_init.load_state_dict(init_lyapunov_state)
+        lyapunov_init.load_state_dict(init_lyapunov_state, strict=False)
+        lyapunov_init.L_chol = None
         lyapunov_init.eval()
 
         # Effective P for initial model
@@ -2700,6 +2847,8 @@ def main(cfg: DictConfig):
             logger=logger,
             c1_threshold=derivative_lyaloss.c1_threshold,
             c1_multiplier=c1_multiplier,
+            uncertainty_transform=uncertainty_transform,
+            **iqc_params,
         )
 
         logger.info(f"Initial verified rho:  {init_rho:.6f}")
@@ -2762,8 +2911,30 @@ def main(cfg: DictConfig):
         logger.info("="*60)
 
     else:
-        # No verify_init: still generate projection plot for final model
+        # No verify_init: still run PGD bisection to get the true verified rho
         P_init_np = None
+        logger.info("="*60)
+        logger.info("POST-TRAINING PGD VERIFICATION (verify_init=False)")
+        logger.info("="*60)
+        final_verified_rho, final_max_rho, final_clean = pgd_find_verified_rho(
+            lyapunov_nn, dynamics, controller, supply_rate,
+            lower_limit, upper_limit, w_max, derivative_lyaloss.get_s_scale_value(),
+            V_decrease_within_roa=V_decrease_within_roa,
+            pgd_steps=cfg.get('pgd_verifier_steps', 300),
+            num_seeds=cfg.get('pgd_verifier_num_seeds', 5),
+            num_samples=50000,
+            num_samples_per_boundary=cfg.train.num_samples_per_boundary,
+            rho_bisect_tol=cfg.get('verify_init_rho_tol', 0.005),
+            max_bisect_iters=cfg.get('verify_init_max_bisect', 20),
+            logger=logger,
+            c1_threshold=derivative_lyaloss.c1_threshold,
+            c1_multiplier=c1_multiplier,
+            uncertainty_transform=uncertainty_transform,
+            **iqc_params,
+        )
+        logger.info(f"Final PGD-verified rho: {final_verified_rho:.6f}  (max possible: {final_max_rho:.6f})")
+        logger.info("="*60)
+
         if final_verified_rho > 0 or rho > 0:
             rho_plot = final_verified_rho if final_verified_rho > 0 else rho
             fig_proj_final = plot_ellipsoid_projections(
@@ -2780,6 +2951,47 @@ def main(cfg: DictConfig):
             fig_proj_final.savefig(proj_path_final, dpi=150)
             plt.close(fig_proj_final)
             logger.info(f"ROA projections saved: {proj_path_final}")
+
+    final_plot_rho = final_verified_rho if final_verified_rho > 0 else rho
+    if final_plot_rho > 0:
+        fig_final_heat = plot_ellipsoid_projections(
+            P_init=None, rho_init=0.0,
+            P_final=P_final_np, rho_final=final_plot_rho,
+            nx=nx, state_labels=state_labels,
+            trajectories=traj_tensor,
+            title=(
+                f"Final PGD-Verified ROA Projections  (ρ={final_plot_rho:.5f})"
+                if final_verified_rho > 0
+                else f"Trained ROA Projections  (ρ={final_plot_rho:.5f})"
+            ),
+            lyapunov_final=lyapunov_nn,
+            lower_limit_tensor=lower_limit,
+            upper_limit_tensor=upper_limit,
+        )
+        heatmap_path = os.path.join(os.getcwd(), "V_roa.png")
+        fig_final_heat.savefig(heatmap_path, dpi=150)
+        plt.close(fig_final_heat)
+        logger.info(f"Final ROA projection plot saved: {heatmap_path}")
+
+        fig_final_flow = plot_flow_field(
+            dynamics=dynamics,
+            controller=controller,
+            lyapunov_nn=lyapunov_nn,
+            rho=final_plot_rho,
+            lower_limit=lower_limit,
+            upper_limit=upper_limit,
+            state_labels=state_labels,
+            trajectories=traj_tensor,
+            title=(
+                f"Closed-Loop Flow Field  (PGD-verified ρ={final_plot_rho:.5f})"
+                if final_verified_rho > 0
+                else f"Closed-Loop Flow Field  (ρ={final_plot_rho:.5f})"
+            ),
+        )
+        flow_path = os.path.join(os.getcwd(), "flow_field.png")
+        fig_final_flow.savefig(flow_path, dpi=150)
+        plt.close(fig_final_flow)
+        logger.info(f"Final flow field plot saved: {flow_path}")
 
     if cfg.train.wandb.enabled:
         if heatmap_path is not None:
@@ -3000,6 +3212,9 @@ def main(cfg: DictConfig):
         "trainable_controller": bool(cfg.model.controller.get(cfg.model.controller.type, {}).get('trainable', False)),
         "init_roa_anchor_expand": float(cfg.get('init_roa_anchor_expand', 1.2)),
         "run_dir": os.getcwd(),
+        "pgd_bisect_verified": bool(final_verified_rho > 0 and final_max_rho > 0),
+        "iqc_lambda_final": derivative_lyaloss.get_iqc_lambda_value() if hasattr(derivative_lyaloss, 'get_iqc_lambda_value') else None,
+        "s_scale_final": derivative_lyaloss.get_s_scale_value() if hasattr(derivative_lyaloss, 'get_s_scale_value') else None,
     }
     results_path = os.path.join(os.getcwd(), "results.json")
     with open(results_path, "w") as _f:

@@ -1,0 +1,36 @@
+# 32x32 sector-bound verification config derived from pendulum_sector_bound.
+#
+# Intent:
+# - Keep the same sector-bound setup and training defaults.
+# - Use a smaller 32x32 Lyapunov NN for the final model.
+# - Verify the initial model as quadratic-only.
+# - Verify the final model with the NN enabled.
+# - Use the best tested input-splitting setting for NN verification.
+#
+# Benchmark basis:
+# - For the full NN model, splits=2 gave the best estimated total verification
+#   time among the tested NN settings.
+# - splits=4 was slower overall, and splits=8 was not benchmarked for the NN
+#   case, so this config uses splits=2.
+
+defaults:
+  - pendulum_sector_bound
+  - _self_
+
+wandb_name: pendulum_sector_bound_nn32_verify
+
+model:
+  lyapunov:
+    hidden_widths: [32, 32]
+
+formal_verification:
+  enabled: True
+  verify_initial: True
+  init_pure_quadratic: True
+  verify_final: True
+
+  # Shared verification settings are chosen for the slower final full-NN pass.
+  # Initial verification still skips the NN because init_pure_quadratic=True.
+  timeout: 2700
+  enable_incomplete_verification: True
+  extra_input_splits: 2
