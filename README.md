@@ -25,8 +25,8 @@ We jointly synthesize neural network controllers and dissipativity certificates 
 
 ```bash
 # 1. Clone and enter the repository
-git clone --recursive https://github.com/verified-intelligence/Lyapunov_Stable_NN_Controllers.git
-cd Lyapunov_Stable_NN_Controllers
+git clone --recursive https://github.com/neelayjunnarkar/local-robust-dissipativity
+cd local-robust-dissipativity
 
 # 2. Create conda environment
 conda create -n lnc python=3.11 -y
