@@ -46,6 +46,8 @@ source setup_env.sh
 
 If a conda environment is already active, `setup_env.sh` keeps it. Otherwise it falls back to activating `lnc`.
 
+For running the LMI verification files (`lmi_verification/quadratic_dissipativity.py`), you will additionally need to install the `cvxpy` package.
+
 ## Experiments
 
 The paper includes two experiments on a torque-limited inverted pendulum with a recurrent implicit neural network (RINN) controller. Both train a Lyapunov-based dissipativity certificate and then verify it with α,β-CROWN.
@@ -88,6 +90,9 @@ Each run:
 
 Results are saved to `output/pendulum_state/<date>/<time>/`.
 
+LMI verification code for both experiments is in `lmi_verification/quadratic_dissipativity.py`.
+
+
 ### Configuration
 
 Training configs are in `examples/config/`. Key parameters:
@@ -103,6 +108,7 @@ Training configs are in `examples/config/`. Key parameters:
 | `formal_verification.enabled` | Run α,β-CROWN after training |
 
 To enable [Weights & Biases](https://wandb.ai) logging, set `wandb_enabled: True` in `examples/config/user/pendulum_state_training_default.yaml`.
+
 
 ## Citation
 
